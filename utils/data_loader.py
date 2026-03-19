@@ -44,6 +44,12 @@ class StandardScaler:
         self.mean = mean
         self.std = std
 
+    def fit(self, data: np.ndarray):
+        """从数据中计算 mean 和 std。"""
+        self.mean = float(np.mean(data))
+        self.std = float(np.std(data))
+        return self
+
     def transform(self, data: np.ndarray) -> np.ndarray:
         return (data - self.mean) / (self.std + 1e-8)
 

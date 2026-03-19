@@ -183,7 +183,7 @@ class AdaGeoHyperTKAN(nn.Module):
         Returns:
             Y_pred: [B, T_out=12, N, C] 预测结果
         """
-        B, T, N, F = x.shape
+        B, T, N, F_in = x.shape
 
         # ---- 1. 空间模块 ----
         # X → H_s: 通过超图卷积增强空间关系

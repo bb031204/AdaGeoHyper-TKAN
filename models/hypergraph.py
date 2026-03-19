@@ -397,7 +397,7 @@ class AdaptiveGeoHypergraph(nn.Module):
         Returns:
             weights: [B, N, K+1] 归一化的自适应权重
         """
-        B, T, N, F = x.shape
+        B, T, N, F_in = x.shape
         K_plus_1 = self.neighbor_indices.shape[1]  # K+1
         device = x.device
 
@@ -455,7 +455,7 @@ class AdaptiveGeoHypergraph(nn.Module):
         """
         assert self._graph_built, "请先调用 build_graph() 构建超图结构！"
 
-        B, T, N, F = x.shape
+        B, T, N, F_in = x.shape
         device = x.device
         K_plus_1 = self.neighbor_indices.shape[1]
         nbr_idx = self.neighbor_indices.to(device)  # [N, K+1]
@@ -465,8 +465,8 @@ class AdaptiveGeoHypergraph(nn.Module):
         # weights: [B, N, K+1]
 
         # ---- 多层超图卷积 ----
-        # 将时间步展开: [B*T, N, F]
-        h = x.reshape(B * T, N, F)
+        # 将时间步展开: [B*T, N, F_in]
+        h = x.reshape(B * T, N, F_in)
 
         for layer_idx in range(self.num_layers):
             # 收集邻居特征
