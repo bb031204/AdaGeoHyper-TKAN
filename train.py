@@ -31,6 +31,7 @@ import torch
 import torch.nn as nn
 from datetime import datetime
 from typing import Dict, Optional
+from tqdm import tqdm
 
 # 将项目根目录加入路径
 project_root = os.path.dirname(os.path.abspath(__file__))
@@ -134,6 +135,8 @@ def build_model(config: dict, feature_dim: int, position_dim: int, device: torch
         fusion_dim=model_cfg["fusion_dim"],
         dropout=model_cfg["dropout"],
         pred_head_hidden=model_cfg["hidden_dim"] * 2,
+        tkan_chunk_size=model_cfg.get("tkan_chunk_size", 0),
+        use_gradient_checkpoint=model_cfg.get("use_gradient_checkpoint", False),
     )
 
     model = model.to(device)
@@ -155,9 +158,15 @@ def train_one_epoch(
     scaler_list,
     epoch: int,
     config: dict,
+    use_amp: bool = False,
+    grad_scaler: Optional[torch.amp.GradScaler] = None,
 ) -> Dict[str, float]:
     """
     训练一个 epoch。
+
+    Args:
+        use_amp:      是否使用 AMP 混合精度
+        grad_scaler:  AMP GradScaler 实例
 
     Returns:
         dict: {'loss': ..., 'MAE': ..., 'RMSE': ..., 'MAPE': ...}
@@ -167,36 +176,76 @@ def train_one_epoch(
     num_batches = 0
     all_preds = []
     all_trues = []
-    log_interval = config["output"].get("log_interval", 10)
+    grad_clip = config["training"].get("grad_clip", 0)
 
-    for batch_idx, (x, y) in enumerate(train_loader):
+    # 使用 tqdm 进度条 (第一个 epoch 首 batch 需 CUDA warmup, 会略慢)
+    pbar = tqdm(
+        train_loader,
+        desc=f"  Epoch {epoch:3d} [Train]",
+        leave=False,
+        ncols=120,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
+    )
+
+    for batch_idx, (x, y) in enumerate(pbar):
         # x: [B, 12, N, F], y: [B, 12, N, F]
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
-        # 前向传播
-        pred = model(x)  # [B, 12, N, C]
+        try:
+            # 前向传播 (AMP autocast)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                pred = model(x)  # [B, 12, N, C]
+                loss = criterion(pred, y)
 
-        # 计算 loss
-        loss = criterion(pred, y)
-        loss.backward()
+            # 反向传播 (AMP scale)
+            if use_amp and grad_scaler is not None:
+                grad_scaler.scale(loss).backward()
+                if grad_clip > 0:
+                    grad_scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+            else:
+                loss.backward()
+                if grad_clip > 0:
+                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
 
-        # 梯度裁剪
-        grad_clip = config["training"].get("grad_clip", 0)
-        if grad_clip > 0:
-            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-
-        optimizer.step()
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                logger.error(
+                    f"[OOM] CUDA 显存溢出! Batch {batch_idx}, "
+                    f"x.shape={x.shape}, 请尝试:\n"
+                    f"  1. 减小 batch_size (当前 {config['training']['batch_size']})\n"
+                    f"  2. 减少 num_stations (当前 {config['data'].get('num_stations', 'all')})\n"
+                    f"  3. 开启 use_amp: true (混合精度)\n"
+                    f"  4. 设置 tkan_chunk_size (如 4096)"
+                )
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                raise
+            else:
+                raise
 
         total_loss += loss.item()
         num_batches += 1
 
+        # 更新进度条信息
+        avg_loss = total_loss / num_batches
+        postfix_dict = {"loss": f"{avg_loss:.4f}"}
+        if device.type == "cuda":
+            mem_used = torch.cuda.memory_allocated() / 1024**3
+            postfix_dict["GPU"] = f"{mem_used:.1f}GB"
+        pbar.set_postfix(postfix_dict)
+
         # 收集用于指标计算的数据 (反标准化)
         with torch.no_grad():
-            pred_np = pred.detach().cpu().numpy()
-            true_np = y.detach().cpu().numpy()
+            # AMP autocast 下 pred 可能是 float16, 需转 float32
+            pred_np = pred.detach().float().cpu().numpy()
+            true_np = y.detach().float().cpu().numpy()
 
             # 反标准化
             for ch in range(pred_np.shape[-1]):
@@ -206,9 +255,7 @@ def train_one_epoch(
             all_preds.append(pred_np)
             all_trues.append(true_np)
 
-        if (batch_idx + 1) % log_interval == 0:
-            avg_loss = total_loss / num_batches
-            logger.info(f"  Epoch {epoch} | Batch {batch_idx+1}/{len(train_loader)} | Loss: {avg_loss:.6f}")
+    pbar.close()
 
     avg_loss = total_loss / max(num_batches, 1)
 
@@ -228,9 +275,13 @@ def evaluate(
     criterion: nn.Module,
     device: torch.device,
     scaler_list,
+    use_amp: bool = False,
 ) -> Dict[str, float]:
     """
     验证/测试评估。
+
+    Args:
+        use_amp: 是否使用 AMP 混合精度
 
     Returns:
         dict: {'loss': ..., 'MAE': ..., 'RMSE': ..., 'MAPE': ...}
@@ -241,18 +292,31 @@ def evaluate(
     all_preds = []
     all_trues = []
 
-    for x, y in data_loader:
+    pbar = tqdm(
+        data_loader,
+        desc=f"         [Val  ]",
+        leave=False,
+        ncols=120,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
+    )
+
+    for x, y in pbar:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
 
-        pred = model(x)
-        loss = criterion(pred, y)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            pred = model(x)
+            loss = criterion(pred, y)
 
         total_loss += loss.item()
         num_batches += 1
 
-        pred_np = pred.cpu().numpy()
-        true_np = y.cpu().numpy()
+        # 更新进度条
+        avg_loss = total_loss / num_batches
+        pbar.set_postfix({"val_loss": f"{avg_loss:.4f}"})
+
+        pred_np = pred.float().cpu().numpy()
+        true_np = y.float().cpu().numpy()
 
         for ch in range(pred_np.shape[-1]):
             pred_np[..., ch] = scaler_list[ch].inverse_transform(pred_np[..., ch])
@@ -260,6 +324,8 @@ def evaluate(
 
         all_preds.append(pred_np)
         all_trues.append(true_np)
+
+    pbar.close()
 
     avg_loss = total_loss / max(num_batches, 1)
     all_preds = np.concatenate(all_preds, axis=0)
@@ -410,6 +476,14 @@ def train(config_path: str = "config.yaml"):
     # ---- 11. 损失函数 ----
     criterion = nn.MSELoss()
 
+    # ---- 11.5 AMP 混合精度 ----
+    use_amp = config["training"].get("use_amp", False) and device.type == "cuda"
+    grad_scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
+    if use_amp:
+        logger.info("[AMP] 混合精度训练已启用 (float16)")
+    else:
+        logger.info("[AMP] 混合精度训练未启用 (float32)")
+
     # ---- 12. 恢复训练 ----
     start_epoch = 1
     best_val_loss = float("inf")
@@ -431,22 +505,53 @@ def train(config_path: str = "config.yaml"):
     val_losses = []
     val_metrics_history = {"MAE": [], "RMSE": [], "MAPE": []}
 
+    # 显存预估
+    if device.type == "cuda":
+        num_st = data["num_stations"]
+        bs = config["training"]["batch_size"]
+        est_mem_gb = (bs * num_st * 64 * 12 * 4 * 6) / (1024**3)  # 粗估
+        gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        logger.info(f"[显存] 预估峰值: ~{est_mem_gb:.1f}GB, GPU 可用: {gpu_mem_gb:.1f}GB")
+        if est_mem_gb > gpu_mem_gb * 0.9 and not use_amp:
+            logger.warning(
+                f"[显存] ⚠️ 预估显存接近/超过 GPU 上限! 强烈建议:\n"
+                f"  1. config.yaml 中设置 use_amp: true\n"
+                f"  2. 减小 batch_size (当前 {bs})\n"
+                f"  3. 减少 num_stations (当前 {num_st})"
+            )
+
     logger.info(f"\n{'='*60}")
     logger.info(f"开始训练: epochs={epochs}, batch_size={config['training']['batch_size']}")
     logger.info(f"早停: {'启用' if use_early_stop else '禁用'}, patience={patience}")
-    logger.info(f"{'='*60}\n")
+    logger.info(f"AMP: {'启用' if use_amp else '禁用'}")
+    logger.info(f"{'='*60}")
+    if device.type == "cuda":
+        logger.info(f"⏳ 首个 batch 需要 CUDA 内核编译 (warmup), 可能等待 1~3 分钟, 请耐心等待...")
+    logger.info("")
 
-    for epoch in range(start_epoch, epochs + 1):
+    epoch_pbar = tqdm(
+        range(start_epoch, epochs + 1),
+        desc="🚀 Training",
+        ncols=140,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} epochs [{elapsed}<{remaining}] {postfix}",
+    )
+
+    for epoch in epoch_pbar:
         epoch_start = time.time()
 
         # 训练
         train_metrics = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, scaler_list, epoch, config
+            model, train_loader, criterion, optimizer, device,
+            scaler_list, epoch, config,
+            use_amp=use_amp, grad_scaler=grad_scaler,
         )
         train_losses.append(train_metrics["loss"])
 
         # 验证
-        val_metrics = evaluate(model, val_loader, criterion, device, scaler_list)
+        val_metrics = evaluate(
+            model, val_loader, criterion, device, scaler_list,
+            use_amp=use_amp,
+        )
         val_losses.append(val_metrics["loss"])
 
         for key in ["MAE", "RMSE", "MAPE"]:
@@ -462,10 +567,24 @@ def train(config_path: str = "config.yaml"):
         # 判断是否为最佳
         is_best = val_metrics["loss"] < best_val_loss
         if is_best:
+            prev_best = best_val_loss
             best_val_loss = val_metrics["loss"]
             no_improve_count = 0
+            if prev_best < float("inf"):
+                loss_delta = val_metrics["loss"] - prev_best  # 负数表示改善
+                best_tag = f"★ New Best (-{abs(loss_delta):.6f})"
+            else:
+                best_tag = "★ New Best (first)"
         else:
             no_improve_count += 1
+            best_tag = ""
+
+        # 更新 epoch 进度条
+        epoch_pbar.set_postfix_str(
+            f"tl={train_metrics['loss']:.4f} vl={val_metrics['loss']:.4f} "
+            f"best={best_val_loss:.4f} lr={current_lr:.1e} "
+            f"{epoch_time:.0f}s/ep"
+        )
 
         # 日志输出
         logger.info(
@@ -477,7 +596,7 @@ def train(config_path: str = "config.yaml"):
             f"Val MAPE: {val_metrics['MAPE']:.2f}% | "
             f"LR: {current_lr:.2e} | "
             f"Time: {epoch_time:.1f}s | "
-            f"{'★ Best' if is_best else ''}"
+            f"{best_tag}"
         )
 
         # 保存 checkpoint
@@ -487,6 +606,8 @@ def train(config_path: str = "config.yaml"):
         if use_early_stop and no_improve_count >= patience:
             logger.info(f"\n[早停] 连续 {patience} 个 epoch 无改善, 停止训练")
             break
+
+    epoch_pbar.close()
 
     # ---- 14. 训练结束 ----
     logger.info(f"\n{'='*60}")

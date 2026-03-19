@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 import logging
 from typing import Optional
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from models.hypergraph import AdaptiveGeoHypergraph
 from models.tkan import TKANLayer
@@ -56,6 +57,8 @@ class AdaGeoHyperTKAN(nn.Module):
         fusion_dim:         融合层维度 (需等于 hidden_dim)
         dropout:            Dropout 比率
         pred_head_hidden:   预测头 MLP 隐藏维度
+        tkan_chunk_size:    TKAN 分块大小 (0=不分块, >0=限制B*N)
+        use_gradient_checkpoint: 是否使用梯度检查点节省显存
     """
 
     def __init__(
@@ -78,6 +81,8 @@ class AdaGeoHyperTKAN(nn.Module):
         fusion_dim: int = 64,
         dropout: float = 0.1,
         pred_head_hidden: int = 128,
+        tkan_chunk_size: int = 0,
+        use_gradient_checkpoint: bool = False,
     ):
         super().__init__()
 
@@ -87,6 +92,8 @@ class AdaGeoHyperTKAN(nn.Module):
         self.tkan_hidden_dim = tkan_hidden_dim
         self.input_len = input_len
         self.pred_len = pred_len
+        self.tkan_chunk_size = tkan_chunk_size
+        self.use_gradient_checkpoint = use_gradient_checkpoint
 
         # 确保 fusion_dim 一致
         assert hidden_dim == tkan_hidden_dim, (
@@ -187,7 +194,10 @@ class AdaGeoHyperTKAN(nn.Module):
 
         # ---- 1. 空间模块 ----
         # X → H_s: 通过超图卷积增强空间关系
-        H_s = self.spatial_module(x)
+        if self.use_gradient_checkpoint and self.training:
+            H_s = grad_checkpoint(self.spatial_module, x, use_reentrant=False)
+        else:
+            H_s = self.spatial_module(x)
         # H_s: [B, T, N, D]
 
         # ---- 2. TKAN 时间模块 ----
@@ -195,8 +205,31 @@ class AdaGeoHyperTKAN(nn.Module):
         # H_s: [B, T, N, D] -> [B*N, T, D]
         H_s_flat = H_s.permute(0, 2, 1, 3).reshape(B * N, T, self.hidden_dim)
 
-        # TKAN 处理时序
-        H_t_flat = self.temporal_module(H_s_flat)
+        # TKAN 处理时序 (支持分块以降低显存峰值)
+        total_seqs = B * N
+        chunk = self.tkan_chunk_size
+
+        if chunk > 0 and total_seqs > chunk:
+            # 分块处理: 每次只送 chunk 条序列给 TKAN
+            chunks_out = []
+            for i in range(0, total_seqs, chunk):
+                chunk_input = H_s_flat[i:i + chunk]
+                if self.use_gradient_checkpoint and self.training:
+                    chunk_out = grad_checkpoint(
+                        self.temporal_module, chunk_input, use_reentrant=False
+                    )
+                else:
+                    chunk_out = self.temporal_module(chunk_input)
+                chunks_out.append(chunk_out)
+            H_t_flat = torch.cat(chunks_out, dim=0)
+        else:
+            # 不分块, 一次性处理
+            if self.use_gradient_checkpoint and self.training:
+                H_t_flat = grad_checkpoint(
+                    self.temporal_module, H_s_flat, use_reentrant=False
+                )
+            else:
+                H_t_flat = self.temporal_module(H_s_flat)
         # H_t_flat: [B*N, T, tkan_hidden_dim]
 
         # 恢复形状: [B*N, T, D] -> [B, N, T, D] -> [B, T, N, D]

@@ -359,6 +359,14 @@ class AdaptiveGeoHypergraph(nn.Module):
         self.positions_tensor = torch.from_numpy(positions).float()
         # positions_tensor: [N, position_dim]
 
+        # 将 buffer 移至模型所在设备 (build_graph 可能在 model.to(device) 之后调用)
+        try:
+            device = next(self.parameters()).device
+            self.neighbor_indices = self.neighbor_indices.to(device)
+            self.positions_tensor = self.positions_tensor.to(device)
+        except StopIteration:
+            pass  # 无参数时保持 CPU
+
         self._graph_built = True
         logger.info(f"[超图] 超图结构已就绪 (N={N}, K={k}, edges={N})")
 

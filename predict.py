@@ -92,6 +92,8 @@ def load_best_model(
         fusion_dim=model_cfg["fusion_dim"],
         dropout=model_cfg["dropout"],
         pred_head_hidden=model_cfg["hidden_dim"] * 2,
+        tkan_chunk_size=model_cfg.get("tkan_chunk_size", 0),
+        use_gradient_checkpoint=False,  # 预测时不需要梯度检查点
     )
 
     model = model.to(device)
@@ -123,6 +125,7 @@ def predict_on_test(
     test_loader,
     device: torch.device,
     scaler_list,
+    use_amp: bool = False,
 ):
     """
     在测试集上进行预测。
@@ -139,10 +142,11 @@ def predict_on_test(
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
 
-        pred = model(x)  # [B, T, N, C]
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            pred = model(x)  # [B, T, N, C]
 
-        pred_np = pred.cpu().numpy()
-        true_np = y.cpu().numpy()
+        pred_np = pred.float().cpu().numpy()
+        true_np = y.float().cpu().numpy()
 
         # 反标准化
         for ch in range(pred_np.shape[-1]):
@@ -283,8 +287,11 @@ def predict(output_dir: str, config_path: str = None):
     model_info = model.get_model_info()
 
     # ---- 预测 ----
+    use_amp = config["training"].get("use_amp", False) and device.type == "cuda"
+    if use_amp:
+        logger.info("[AMP] 混合精度推理已启用")
     logger.info("[预测] 开始测试集预测...")
-    predictions, ground_truth = predict_on_test(model, test_loader, device, scaler_list)
+    predictions, ground_truth = predict_on_test(model, test_loader, device, scaler_list, use_amp=use_amp)
     logger.info(f"[预测] 预测完成: pred={predictions.shape}, truth={ground_truth.shape}")
 
     # ---- 评估指标 ----

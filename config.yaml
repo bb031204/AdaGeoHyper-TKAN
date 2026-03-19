@@ -5,12 +5,15 @@
 
 # ---- 数据相关 ----
 data:
-  dataset_name: "temperature"          # 可选: temperature / cloud_cover / humidity / component_of_wind
+  dataset_name: "temperature"   
+ # dataset_name: "cloud_cover"  
+ # dataset_name: "humidity"   
+ # dataset_name: "component_of_wind"          # 可选: temperature / cloud_cover / humidity / component_of_wind
   data_root: "D:/bishe/WYB"            # 数据根目录
   input_len: 12                         # 输入时间步长
   pred_len: 12                          # 预测时间步长
-  num_stations: null                    # null=使用全部站点(2048)，或指定如 512, 1024
-  sample_ratio: 1.0                     # 训练集样本抽样比例 (0~1)
+  num_stations: 1024                    # null=使用全部站点(2048)，或指定如 512, 1024  ← 服务器上改为 null (全部2048站点, 空间信息更完整)
+  sample_ratio: 0.5                     # 训练集样本抽样比例 (0~1)  ← 服务器上改为 1.0 (使用全部训练样本)
   val_sample_ratio: 1.0                 # 验证集样本抽样比例
   test_sample_ratio: 1.0               # 测试集样本抽样比例
   include_context: false                # 是否使用 context 特征
@@ -36,14 +39,16 @@ model:
   kan_grid_size: 5                      # KAN B-spline 网格大小
   kan_spline_order: 3                   # KAN B-spline 阶数
   hypergraph_layers: 2                  # 超图卷积层数
+  tkan_chunk_size: 0                    # TKAN分块 (0=不分块, >0如4096=限制单次B*N)
+  use_gradient_checkpoint: false        # 梯度检查点 (极端省显存, 训练变慢)
 
 # ---- 训练相关 ----
 training:
-  batch_size: 32                        # 批大小
-  epochs: 100                           # 最大训练轮数
+  batch_size: 16                        # 批大小 (8GB显存建议16)  ← 服务器上改为 32 或 64 (更大batch梯度更稳定)
+  epochs: 200                           # 最大训练轮数
   learning_rate: 0.001                  # 学习率
   weight_decay: 0.0001                  # 权重衰减
-  device: "auto"                        # auto / cuda / cpu
+  device: "cuda"                        # cuda(优先GPU) / auto / cpu
   seed: 42                              # 随机种子
   patience: 15                          # 早停耐心值
   use_early_stop: true                  # 是否使用早停
@@ -51,6 +56,7 @@ training:
   scheduler_step_size: 20               # StepLR 步长
   scheduler_gamma: 0.5                  # StepLR 衰减因子
   grad_clip: 1.0                        # 梯度裁剪阈值
+  use_amp: true                         # 混合精度训练 (GPU推荐, 显存减半)  ← 服务器显存充裕时可改为 false (全精度训练, 精度更高)
 
 # ---- 输出相关 ----
 output:
