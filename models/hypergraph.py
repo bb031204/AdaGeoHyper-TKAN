@@ -1,0 +1,510 @@
+"""
+AdaptiveGeoHypergraph: 自适应地理邻域超图空间模块
+================================================
+
+基于经度、纬度、海拔构建自适应邻域超图，用于刻画多站点之间
+具有物理意义的高阶空间依赖关系。
+
+设计思想:
+1. 节点定义: 每个站点 v_i, 静态属性 p_i = [lon_i, lat_i, alt_i]
+2. 距离定义: d_ij = sqrt(λ_g * d_geo(i,j)^2 + λ_h * (alt_i - alt_j)^2)
+   - d_geo: 球面距离 (Haversine)
+   - λ_g, λ_h: 距离权重
+3. 超边构造: e_i = {v_i} ∪ N_i^geo (K近邻)
+4. 自适应权重:
+   - 状态摘要: s_i = Pool(X_i)
+   - 打分函数: u_ij = φ([p_i, p_j, s_i, s_j])
+   - 归一化:   α_ij = softmax(u_ij) 在邻域内
+5. 空间传播: z_i = Σ_{j∈e_i} α_ij * x_j * W
+
+关键特性:
+- 地理邻域骨架固定、邻域贡献强度动态变化
+- 支持构图缓存
+- 与 TKAN 时间模块解耦
+
+输入: [B, T, N, F]
+输出: [B, T, N, D] (空间增强特征 H_s)
+"""
+
+import os
+import math
+import json
+import hashlib
+import logging
+import time
+import pickle
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+def haversine_distance_matrix(lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
+    """
+    计算所有站点之间的 Haversine 球面距离矩阵。
+
+    Args:
+        lon: [N] 经度 (度)
+        lat: [N] 纬度 (度)
+
+    Returns:
+        dist: [N, N] 球面距离 (km)
+    """
+    R = 6371.0  # 地球半径 (km)
+    lon_rad = np.radians(lon)
+    lat_rad = np.radians(lat)
+
+    # 广播计算
+    dlon = lon_rad[:, None] - lon_rad[None, :]
+    dlat = lat_rad[:, None] - lat_rad[None, :]
+
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat_rad[:, None]) * np.cos(lat_rad[None, :]) * np.sin(dlon / 2) ** 2
+    a = np.clip(a, 0, 1)  # 数值稳定
+    c = 2 * np.arcsin(np.sqrt(a))
+    return R * c
+
+
+def compute_geographic_distance(
+    positions: np.ndarray,
+    lambda_geo: float = 1.0,
+    lambda_alt: float = 0.5,
+) -> np.ndarray:
+    """
+    计算站点之间的三维地理距离。
+
+    d_ij = sqrt(λ_g * d_geo(i,j)^2 + λ_h * (alt_i - alt_j)^2)
+
+    Args:
+        positions: [N, 2] 或 [N, 3] (lon, lat) 或 (lon, lat, alt)
+        lambda_geo: 平面距离权重
+        lambda_alt: 海拔差权重
+
+    Returns:
+        distances: [N, N] 距离矩阵
+    """
+    lon = positions[:, 0]
+    lat = positions[:, 1]
+
+    # 球面距离 (km)
+    geo_dist = haversine_distance_matrix(lon, lat)
+
+    if positions.shape[1] >= 3:
+        alt = positions[:, 2]
+        alt_diff = alt[:, None] - alt[None, :]
+        # 海拔差转为 km
+        alt_diff_km = alt_diff / 1000.0
+        combined = np.sqrt(lambda_geo * geo_dist ** 2 + lambda_alt * alt_diff_km ** 2)
+    else:
+        combined = np.sqrt(lambda_geo * geo_dist ** 2)
+
+    return combined
+
+
+def build_knn_hypergraph(
+    distances: np.ndarray,
+    k: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    基于距离矩阵构建 K近邻超图结构。
+
+    每个站点生成一条超边, 连接自身及其 K 个最近邻。
+
+    Args:
+        distances: [N, N] 距离矩阵
+        k:         近邻数
+
+    Returns:
+        neighbor_indices: [N, K+1] 每个节点的超边成员 (含自身)
+        neighbor_dists:   [N, K+1] 对应距离
+    """
+    N = distances.shape[0]
+    k = min(k, N - 1)  # K 不超过 N-1
+
+    # 对每个节点找 K+1 近邻 (包含自身, 距离为0)
+    sorted_indices = np.argsort(distances, axis=-1)[:, : k + 1]
+    # 对应距离
+    sorted_dists = np.take_along_axis(distances, sorted_indices, axis=-1)
+
+    return sorted_indices, sorted_dists
+
+
+def get_cache_key(
+    dataset_name: str,
+    num_stations: int,
+    k_neighbors: int,
+    lambda_geo: float,
+    lambda_alt: float,
+    station_indices: Optional[np.ndarray] = None,
+) -> str:
+    """生成超图缓存键值。"""
+    key_data = {
+        "dataset": dataset_name,
+        "num_stations": num_stations,
+        "k_neighbors": k_neighbors,
+        "lambda_geo": lambda_geo,
+        "lambda_alt": lambda_alt,
+    }
+    if station_indices is not None:
+        key_data["station_hash"] = hashlib.md5(station_indices.tobytes()).hexdigest()
+    key_str = json.dumps(key_data, sort_keys=True)
+    return hashlib.md5(key_str.encode()).hexdigest()
+
+
+class AdaptiveScorer(nn.Module):
+    """
+    自适应局部打分函数 φ
+
+    对于中心站点 v_i 及其邻居 v_j:
+    u_ij = φ([p_i, p_j, s_i, s_j])
+
+    使用两层 MLP 实现。
+
+    Args:
+        position_dim: 位置特征维度 (2 或 3)
+        summary_dim:  状态摘要维度
+        hidden_dim:   MLP 隐藏维度
+    """
+
+    def __init__(self, position_dim: int, summary_dim: int, hidden_dim: int = 32):
+        super().__init__()
+        input_dim = position_dim * 2 + summary_dim * 2  # [p_i, p_j, s_i, s_j]
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+        self,
+        p_center: torch.Tensor,
+        p_neighbor: torch.Tensor,
+        s_center: torch.Tensor,
+        s_neighbor: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            p_center:   [B, N, K+1, P] 中心节点位置 (广播)
+            p_neighbor: [B, N, K+1, P] 邻居节点位置
+            s_center:   [B, N, K+1, D_s] 中心节点状态摘要 (广播)
+            s_neighbor: [B, N, K+1, D_s] 邻居节点状态摘要
+
+        Returns:
+            scores: [B, N, K+1] 打分
+        """
+        combined = torch.cat([p_center, p_neighbor, s_center, s_neighbor], dim=-1)
+        # combined: [B, N, K+1, input_dim]
+        scores = self.mlp(combined).squeeze(-1)
+        # scores: [B, N, K+1]
+        return scores
+
+
+class AdaptiveGeoHypergraph(nn.Module):
+    """
+    自适应地理邻域超图空间模块
+
+    只负责空间关系建模，不负责最终预测。
+
+    流程:
+    1. 构建静态 K-NN 超图骨架 (基于地理距离, 可缓存)
+    2. 计算站点状态摘要 s_i = Pool(X_i)
+    3. 动态计算邻域权重 α_ij
+    4. 加权超图卷积: z_i = Σ α_ij * x_j @ W
+
+    Args:
+        input_dim:    输入特征维度
+        hidden_dim:   输出隐藏维度
+        position_dim: 位置维度 (2=lon/lat, 3=lon/lat/alt)
+        k_neighbors:  K近邻数
+        lambda_geo:   平面距离权重
+        lambda_alt:   海拔差权重
+        summary_pool: 摘要方式 ('mean', 'last', 'linear')
+        scorer_hidden_dim: 打分MLP隐藏维度
+        num_layers:   超图卷积层数
+        dropout:      Dropout比率
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        position_dim: int = 2,
+        k_neighbors: int = 8,
+        lambda_geo: float = 1.0,
+        lambda_alt: float = 0.5,
+        summary_pool: str = "mean",
+        scorer_hidden_dim: int = 32,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.position_dim = position_dim
+        self.k_neighbors = k_neighbors
+        self.lambda_geo = lambda_geo
+        self.lambda_alt = lambda_alt
+        self.summary_pool = summary_pool
+        self.num_layers = num_layers
+
+        # ---- 状态摘要 ----
+        summary_dim = hidden_dim
+        if summary_pool == "linear":
+            self.summary_proj = nn.Sequential(
+                nn.Linear(input_dim, summary_dim),
+                nn.ReLU(inplace=True),
+            )
+        else:
+            self.summary_proj = nn.Linear(input_dim, summary_dim)
+
+        # ---- 自适应打分函数 ----
+        self.scorer = AdaptiveScorer(
+            position_dim=position_dim,
+            summary_dim=summary_dim,
+            hidden_dim=scorer_hidden_dim,
+        )
+
+        # ---- 超图卷积层 ----
+        self.conv_layers = nn.ModuleList()
+        for i in range(num_layers):
+            in_d = input_dim if i == 0 else hidden_dim
+            self.conv_layers.append(nn.Linear(in_d, hidden_dim))
+
+        # ---- 层归一化与激活 ----
+        self.layer_norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
+        self.dropout_layer = nn.Dropout(dropout)
+        self.activation = nn.ReLU(inplace=True)
+
+        # ---- 超图结构缓冲区 ----
+        # 在 build_graph 时注册
+        self.register_buffer("neighbor_indices", None)
+        self.register_buffer("positions_tensor", None)
+
+        self._graph_built = False
+
+    def build_graph(
+        self,
+        positions: np.ndarray,
+        cache_dir: Optional[str] = None,
+        dataset_name: str = "",
+        use_cache: bool = True,
+        station_indices: Optional[np.ndarray] = None,
+    ):
+        """
+        构建超图结构 (可缓存)。
+
+        Args:
+            positions:       [N, 2] 或 [N, 3] 站点位置 (lon, lat[, alt])
+            cache_dir:       缓存目录
+            dataset_name:    数据集名称
+            use_cache:       是否使用缓存
+            station_indices: 站点采样索引
+        """
+        N = positions.shape[0]
+        k = min(self.k_neighbors, N - 1)
+
+        cache_hit = False
+        cache_path = None
+
+        # ---- 尝试加载缓存 ----
+        if use_cache and cache_dir is not None:
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_key = get_cache_key(
+                dataset_name, N, k, self.lambda_geo, self.lambda_alt, station_indices
+            )
+            cache_path = os.path.join(cache_dir, f"hypergraph_{cache_key}.pkl")
+
+            if os.path.exists(cache_path):
+                logger.info(f"[超图] 命中缓存: {cache_path}")
+                with open(cache_path, "rb") as f:
+                    cached = pickle.load(f)
+                neighbor_indices = cached["neighbor_indices"]
+                cache_hit = True
+                logger.info(f"[超图] 从缓存加载成功, 站点数={N}, K={k}")
+
+        # ---- 构建超图 ----
+        if not cache_hit:
+            logger.info(f"[超图] 未命中缓存, 开始构图...")
+            t_start = time.time()
+
+            distances = compute_geographic_distance(positions, self.lambda_geo, self.lambda_alt)
+            neighbor_indices, neighbor_dists = build_knn_hypergraph(distances, k)
+
+            t_elapsed = time.time() - t_start
+            logger.info(
+                f"[超图] 构图完成: 站点数={N}, K={k}, "
+                f"超边数={N}, 耗时={t_elapsed:.2f}s"
+            )
+            logger.info(
+                f"[超图] 平均邻居距离: {neighbor_dists[:, 1:].mean():.2f}km, "
+                f"最大距离: {neighbor_dists[:, -1].max():.2f}km"
+            )
+
+            # 保存缓存
+            if use_cache and cache_path is not None:
+                with open(cache_path, "wb") as f:
+                    pickle.dump({
+                        "neighbor_indices": neighbor_indices,
+                        "neighbor_dists": neighbor_dists,
+                    }, f)
+                logger.info(f"[超图] 缓存已保存: {cache_path}")
+
+        # ---- 注册为 buffer ----
+        self.neighbor_indices = torch.from_numpy(neighbor_indices).long()
+        # neighbor_indices: [N, K+1]
+
+        # 位置 tensor (用于打分函数)
+        self.positions_tensor = torch.from_numpy(positions).float()
+        # positions_tensor: [N, position_dim]
+
+        self._graph_built = True
+        logger.info(f"[超图] 超图结构已就绪 (N={N}, K={k}, edges={N})")
+
+    def _compute_state_summary(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        计算站点状态摘要。
+
+        Args:
+            x: [B, T, N, F] 输入时间窗口
+
+        Returns:
+            summary: [B, N, D_summary] 状态摘要
+        """
+        if self.summary_pool == "mean":
+            # 时间维度平均池化
+            pooled = x.mean(dim=1)  # [B, N, F]
+        elif self.summary_pool == "last":
+            # 最后时刻
+            pooled = x[:, -1, :, :]  # [B, N, F]
+        else:
+            # 平均池化 + 线性映射
+            pooled = x.mean(dim=1)  # [B, N, F]
+
+        summary = self.summary_proj(pooled)  # [B, N, D_summary]
+        return summary
+
+    def _compute_adaptive_weights(
+        self, x: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        计算自适应邻域权重。
+
+        Args:
+            x: [B, T, N, F] 输入
+
+        Returns:
+            weights: [B, N, K+1] 归一化的自适应权重
+        """
+        B, T, N, F = x.shape
+        K_plus_1 = self.neighbor_indices.shape[1]  # K+1
+        device = x.device
+
+        # 状态摘要
+        summary = self._compute_state_summary(x)  # [B, N, D_summary]
+
+        # 位置信息
+        positions = self.positions_tensor.to(device)  # [N, P]
+
+        # ---- 收集邻居信息 ----
+        nbr_idx = self.neighbor_indices.to(device)  # [N, K+1]
+
+        # 中心节点位置 (广播)
+        p_center = positions.unsqueeze(1).expand(-1, K_plus_1, -1)
+        # p_center: [N, K+1, P]
+
+        # 邻居节点位置
+        p_neighbor = positions[nbr_idx]
+        # p_neighbor: [N, K+1, P]
+
+        # 中心节点摘要 (广播)
+        s_center = summary.unsqueeze(2).expand(-1, -1, K_plus_1, -1)
+        # s_center: [B, N, K+1, D_s]
+
+        # 邻居节点摘要
+        s_neighbor = summary[:, nbr_idx, :]
+        # 索引: summary [B, N, D_s], nbr_idx [N, K+1]
+        # 结果: [B, N, K+1, D_s]
+
+        # 扩展位置维度以匹配 batch
+        p_center = p_center.unsqueeze(0).expand(B, -1, -1, -1)
+        # p_center: [B, N, K+1, P]
+        p_neighbor = p_neighbor.unsqueeze(0).expand(B, -1, -1, -1)
+        # p_neighbor: [B, N, K+1, P]
+
+        # 计算打分
+        scores = self.scorer(p_center, p_neighbor, s_center, s_neighbor)
+        # scores: [B, N, K+1]
+
+        # softmax 归一化
+        weights = F.softmax(scores, dim=-1)
+        # weights: [B, N, K+1]
+
+        return weights
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        超图空间传播前向传播。
+
+        Args:
+            x: [B, T, N, F] 输入时空特征
+
+        Returns:
+            H_s: [B, T, N, D] 空间增强特征
+        """
+        assert self._graph_built, "请先调用 build_graph() 构建超图结构！"
+
+        B, T, N, F = x.shape
+        device = x.device
+        K_plus_1 = self.neighbor_indices.shape[1]
+        nbr_idx = self.neighbor_indices.to(device)  # [N, K+1]
+
+        # ---- 计算自适应权重 ----
+        weights = self._compute_adaptive_weights(x)
+        # weights: [B, N, K+1]
+
+        # ---- 多层超图卷积 ----
+        # 将时间步展开: [B*T, N, F]
+        h = x.reshape(B * T, N, F)
+
+        for layer_idx in range(self.num_layers):
+            # 收集邻居特征
+            # h: [B*T, N, D_in]
+            D_in = h.shape[-1]
+
+            # 邻居特征: 使用 index_select + reshape
+            # nbr_idx: [N, K+1], 值域 [0, N)
+            nbr_features = h[:, nbr_idx.reshape(-1), :].reshape(B * T, N, K_plus_1, D_in)
+            # nbr_features: [B*T, N, K+1, D_in]
+
+            # 权重扩展到时间步: [B, N, K+1] -> [B*T, N, K+1]
+            w = weights.unsqueeze(1).expand(-1, T, -1, -1).reshape(B * T, N, K_plus_1)
+            # w: [B*T, N, K+1]
+
+            # 加权聚合
+            w_expanded = w.unsqueeze(-1)  # [B*T, N, K+1, 1]
+            aggregated = (nbr_features * w_expanded).sum(dim=2)
+            # aggregated: [B*T, N, D_in]
+
+            # 线性变换
+            h = self.conv_layers[layer_idx](aggregated)
+            # h: [B*T, N, D]
+
+            # LayerNorm + 激活 + Dropout
+            h = self.layer_norms[layer_idx](h)
+            h = self.activation(h)
+            h = self.dropout_layer(h)
+
+        # 恢复时间维度
+        H_s = h.reshape(B, T, N, self.hidden_dim)
+        # H_s: [B, T, N, D]
+
+        return H_s
+
+    def extra_repr(self) -> str:
+        return (
+            f"input_dim={self.input_dim}, hidden_dim={self.hidden_dim}, "
+            f"k_neighbors={self.k_neighbors}, num_layers={self.num_layers}, "
+            f"graph_built={self._graph_built}"
+        )
