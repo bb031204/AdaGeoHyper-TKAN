@@ -27,6 +27,7 @@ import json
 import shutil
 import logging
 import warnings
+import threading
 import numpy as np
 import torch
 import torch.nn as nn
@@ -657,31 +658,117 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         _sample_x, _sample_y = next(iter(train_loader))
         _sample_x = _sample_x.to(device, non_blocking=True)
         _sample_y = _sample_y.to(device, non_blocking=True)
+        _bs = int(config["training"]["batch_size"])
+        _train_tail_bs = len(train_loader.dataset) % _bs
+        _val_tail_bs = len(val_loader.dataset) % _bs
+        _warmup_steps = 3
+        if 0 < _train_tail_bs < _sample_x.shape[0]:
+            _warmup_steps += 1
+        if 0 < _val_tail_bs < _sample_x.shape[0]:
+            _warmup_steps += 1
+        _warmup_bar = tqdm(
+            total=_warmup_steps,
+            desc=f"    {C.YELLOW}Warmup{C.RESET}",
+            leave=False,
+            ncols=120,
+            bar_format="{l_bar}{bar:35}| {n_fmt}/{total_fmt} [{elapsed}]",
+        )
+
+        def _run_warmup_stage(stage_name: str, fn):
+            stage_start = time.time()
+            stop_event = threading.Event()
+
+            def _heartbeat():
+                while not stop_event.wait(15):
+                    stage_elapsed = time.time() - stage_start
+                    total_elapsed = time.time() - _warmup_start
+                    tqdm.write(
+                        f"    [Warmup] {stage_name} 进行中... "
+                        f"stage={stage_elapsed:.0f}s, total={total_elapsed:.0f}s"
+                    )
+
+            hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+            hb_thread.start()
+            try:
+                fn()
+            finally:
+                stop_event.set()
+                hb_thread.join(timeout=0.2)
+
+            stage_elapsed = time.time() - stage_start
+            total_elapsed = time.time() - _warmup_start
+            _warmup_bar.set_postfix(
+                {"stage": stage_name, "last": f"{stage_elapsed:.1f}s", "total": f"{total_elapsed:.1f}s"}
+            )
+            _warmup_bar.update(1)
+            tqdm_log(f"    [Warmup] {stage_name} 完成, 用时 {stage_elapsed:.1f}s")
 
         # 1) 编译 train 前向 + 反向图
-        model.train()
-        optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast("cuda", enabled=use_amp):
-            _warmup_pred = model(_sample_x)
-            _warmup_loss = criterion(_warmup_pred, _sample_y)
-        if use_amp and grad_scaler is not None:
-            grad_scaler.scale(_warmup_loss).backward()
-        else:
-            _warmup_loss.backward()
+        def _stage_train_full():
+            model.train()
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                warmup_pred = model(_sample_x)
+                warmup_loss = criterion(warmup_pred, _sample_y)
+            if use_amp and grad_scaler is not None:
+                grad_scaler.scale(warmup_loss).backward()
+            else:
+                warmup_loss.backward()
+            del warmup_pred, warmup_loss
+
+        _run_warmup_stage("train fwd+bwd", _stage_train_full)
 
         # 2) 编译 eval 前向图
-        model.eval()
-        with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
-            _ = model(_sample_x)
+        def _stage_val_full():
+            model.eval()
+            with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
+                model(_sample_x)
+
+        _run_warmup_stage("val fwd", _stage_val_full)
+
+        # 2.5) 预编译尾 batch 形状，避免首个 epoch 在最后一个 batch 临时编译卡顿
+        # train: 需要前向+反向图
+        if 0 < _train_tail_bs < _sample_x.shape[0]:
+            def _stage_train_tail():
+                tail_x = _sample_x[:_train_tail_bs]
+                tail_y = _sample_y[:_train_tail_bs]
+                model.train()
+                optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    tail_pred = model(tail_x)
+                    tail_loss = criterion(tail_pred, tail_y)
+                if use_amp and grad_scaler is not None:
+                    grad_scaler.scale(tail_loss).backward()
+                else:
+                    tail_loss.backward()
+                del tail_pred, tail_loss, tail_x, tail_y
+
+            _run_warmup_stage(f"train tail bs={_train_tail_bs}", _stage_train_tail)
+
+        # val: 只需要前向图
+        if 0 < _val_tail_bs < _sample_x.shape[0]:
+            def _stage_val_tail():
+                val_tail_x = _sample_x[:_val_tail_bs]
+                model.eval()
+                with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
+                    model(val_tail_x)
+                del val_tail_x
+
+            _run_warmup_stage(f"val tail bs={_val_tail_bs}", _stage_val_tail)
 
         # 3) 恢复原始模型权重和优化器 (warmup 不影响真正训练)
-        _raw_model.load_state_dict(_saved_state)
-        optimizer.zero_grad(set_to_none=True)
-        optimizer.state.clear()
-        if use_amp and grad_scaler is not None:
-            grad_scaler = torch.amp.GradScaler("cuda", enabled=True)
+        def _stage_restore():
+            nonlocal grad_scaler
+            _raw_model.load_state_dict(_saved_state)
+            optimizer.zero_grad(set_to_none=True)
+            optimizer.state.clear()
+            if use_amp and grad_scaler is not None:
+                grad_scaler = torch.amp.GradScaler("cuda", enabled=True)
 
-        del _warmup_pred, _warmup_loss, _sample_x, _sample_y, _, _saved_state
+        _run_warmup_stage("restore state", _stage_restore)
+        _warmup_bar.close()
+
+        del _sample_x, _sample_y, _saved_state
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 

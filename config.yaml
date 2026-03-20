@@ -12,24 +12,24 @@ data:
   data_root: "D:/bishe/WYB"            # 数据根目录
   input_len: 12                         # 输入时间步长
   pred_len: 12                          # 预测时间步长
-  num_stations: 1200                    # null=使用全部站点(2048); 也可设为 512/1024
+  num_stations: 1028                    # null=使用全部站点(2048); 也可设为 512/1024
   sample_ratio: 1.0                     # 训练集样本采样比例 (0~1)
   val_sample_ratio: 1.0                 # 验证集样本采样比例
   test_sample_ratio: 1.0                # 测试集样本采样比例
-  include_context: false                # 是否启用 context 特征拼接到模型输入
+  include_context: true                # 是否启用 context 特征拼接到模型输入
   context_features:
     use_year: true                      # 年
     use_month: true                     # 月
     use_day: true                       # 日
     use_time: false                     # 时间窗内索引
-    use_region: false                   # 陆地覆盖比例/陆海掩码类特征 (0~1)
+    use_region: true                   # 陆地覆盖比例/陆海掩码类特征 (0~1)
     use_altitude: false                 # 海拔
     use_longitude: false                # 经度
     use_latitude: false                 # 纬度
 
 # ---- 超图配置 ----
 hypergraph:
-  k_neighbors: 8                        # K近邻数量
+  k_neighbors: 6                        # K近邻数量
   lambda_geo: 1.0                       # 地理平面距离权重
   lambda_alt: 0.5                       # 海拔差权重
   use_context_altitude: true            # position.pkl 无海拔时，是否用 context 第5通道作为海拔
@@ -55,7 +55,7 @@ model:
 # ---- 训练配置 ----
 training:
   batch_size: 16                        # 批大小
-  epochs: 50                            # 训练轮数
+  epochs: 100                            # 训练轮数
   learning_rate: 0.001                  # 学习率
   weight_decay: 0.0001                  # 权重衰减
   device: "cuda"                        # cuda / auto / cpu
