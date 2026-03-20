@@ -45,7 +45,7 @@ model:
 # ---- 训练相关 ----
 training:
   batch_size: 16                        # 批大小 (8GB显存建议16)  ← 服务器上改为 32 或 64 (更大batch梯度更稳定)
-  epochs: 200                           # 最大训练轮数
+  epochs: 50                           # 最大训练轮数
   learning_rate: 0.001                  # 学习率
   weight_decay: 0.0001                  # 权重衰减
   device: "cuda"                        # cuda(优先GPU) / auto / cpu

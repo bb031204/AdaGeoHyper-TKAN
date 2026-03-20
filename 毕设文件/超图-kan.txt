@@ -1,0 +1,244 @@
+# Hypergraph Kolmogorov–Arnold Networks for Station-Level Meteorological Forecasting
+
+**Jian Tang**, **Kai Ma\***  
+College of Computer and Information Technology, China Three Gorges University, Yichang, 443002, Hubei, China  
+
+E-mail: tjbest1003@126.com; makai@ctgu.edu.cn  
+
+---
+
+## Abstract
+
+Weather forecasting plays a vital role in various domains, including disaster prevention, resource management, and energy optimization. Meteorological observation data are crucial for accurate weather forecasting, as they provide the spatial and temporal information needed to capture complex weather patterns. Graph Neural Networks (GNNs), due to their ability to handle non-Euclidean spatial relationships, can model the spatial dependencies among weather stations and have achieved good results in various weather prediction tasks. However, traditional graph neural networks often fall short in capturing complex, multi-dimensional dependencies across different scales.
+
+This paper introduces a novel multi-information spatio-temporal hypergraph learning framework. By integrating neighborhood and semantic hypergraph convolutional networks, the framework aggregates information from spatially adjacent and semantically similar weather data. Additionally, the Kolmogorov–Arnold Network (KAN) is introduced to enhance the model’s ability to learn dynamic, high-dimensional feature representations using learnable univariate functions instead of fixed linear weights. Experiments on benchmark datasets show that the proposed method surpasses traditional spatio-temporal graph neural networks.
+
+---
+
+## Keywords
+
+Weather forecasting · Graph neural network · Hypergraph · Kolmogorov–Arnold Network
+
+---
+
+## 1. Introduction
+
+Weather changes have profoundly affected human production and daily life. Accurate weather forecasting improves disaster prevention and decision-making in agriculture, transportation, tourism, and energy management. Traditional numerical weather prediction (NWP) relies on numerical integration of physical equations but is computationally expensive and sensitive to initial conditions.
+
+With the development of deep learning, data-driven forecasting models have gained attention. Convolutional Neural Networks (CNNs), Recurrent Neural Networks (RNNs), Transformers, Diffusion Models, and Graph Neural Networks (GNNs) have been applied to meteorological forecasting tasks. Among them, GNNs are especially suitable for irregularly distributed weather stations.
+
+However, traditional GNNs mainly rely on pairwise spatial relationships, limiting their ability to model high-order dependencies, noise, and long-range semantic correlations. Hypergraph Neural Networks (HGNNs) provide a promising solution by modeling higher-order relationships among multiple nodes. Meanwhile, Kolmogorov–Arnold Networks (KANs) improve nonlinear representation efficiency by replacing fixed linear weights with learnable univariate functions.
+
+To address these challenges, this paper proposes **Hypergraph Kolmogorov–Arnold Networks (HyperGKAN)** for station-level short-term weather forecasting.
+
+### Contributions
+
+- Modeling spatial dependencies using hypergraphs to capture higher-order meteorological relationships.
+- Proposing a multi-information spatio-temporal hypergraph framework combining neighborhood and semantic hypergraphs.
+- Introducing Kolmogorov–Arnold Networks for dynamic and expressive feature propagation.
+
+---
+
+## 2. Related Work
+
+### 2.1 Deep Learning-Based Weather Forecasting
+
+Deep learning models have shown advantages over NWP in accuracy and efficiency. CNN-based encoder–decoder models capture spatial features, while RNNs and LSTMs model temporal dependencies. Transformers and Fourier Neural Operators further improve global forecasting.
+
+GNN-based approaches model meteorological fields as graphs, enabling flexible spatial dependency modeling. However, most GNNs rely on pairwise relationships and struggle with high-order spatial correlations.
+
+### 2.2 Hypergraph Neural Networks
+
+Hypergraphs extend graphs by allowing hyperedges to connect multiple nodes. Hypergraph Neural Networks (HGNNs) have been proposed to capture higher-order dependencies. Variants such as HGNN+, HyperGAT, Hyper-SAGNN, AllSet, and T-HyperGNN further improve expressiveness and flexibility.
+
+Hypergraph models have shown strong performance in multimodal data processing and time-series forecasting, motivating their use in meteorological modeling.
+
+---
+
+## 3. Methodology
+
+### 3.1 Problem Definition
+
+Let the meteorological data at time step $t$ be:
+
+$$
+X_t = \{x_1^t, x_2^t, \dots, x_P^t\} \in \mathbb{R}^{P \times Q}
+$$
+
+where $P$ is the number of stations and $Q$ is the number of meteorological features.
+
+Given historical observations:
+
+$$
+\{X_{t-k}, \dots, X_t\}
+$$
+
+the goal is to predict future values:
+
+$$
+\{X_{t+1}, \dots, X_{t+m}\}
+$$
+
+---
+
+### 3.2 Overall Architecture
+
+HyperGKAN adopts a sequence-to-sequence encoder–decoder architecture. The model consists of:
+
+- Input: station locations and historical meteorological data
+- Hypergraph construction:
+  - Neighborhood hypergraph based on geodesic distance (KNN)
+  - Semantic hypergraph based on feature similarity
+- Feature extraction using KAN-based hypergraph convolution
+- Temporal modeling using GRUs with HyperGKAN layers
+
+---
+
+### 3.3 Hypergraph Construction
+
+A hypergraph is defined as $G = (V, E)$, where vertices represent weather stations.
+
+Vertex degree:
+
+$$
+d(v) = \sum_{e \in E} w(e) H(v,e)
+$$
+
+Hyperedge degree:
+
+$$
+\delta(e) = \sum_{v \in V} H(v,e)
+$$
+
+#### Neighborhood Hypergraph
+
+The neighborhood hypergraph models spatial proximity using geodesic distance and KNN. Hyperedge weights are defined as:
+
+$$
+w_{ij} = \frac{x_i^t - x_j^t}{\sum_m (x_i^t - x_m^t)}
+$$
+
+#### Semantic Hypergraph
+
+The semantic hypergraph captures long-range similarity using Euclidean distance between historical meteorological time series, representing latent topographic and climatic similarity.
+
+---
+
+### 3.4 Kolmogorov–Arnold Networks (KAN)
+
+Based on the Kolmogorov–Arnold representation theorem, any multivariate function can be decomposed as:
+
+$$
+f(x) = \sum_{i=1}^{2d+1} \Phi_i \left( \sum_{j=1}^d \phi_{ij}(x_j) \right)
+$$
+
+KAN replaces fixed activations with learnable univariate spline functions, achieving strong nonlinear representation with shallow architectures.
+
+---
+
+### 3.5 KAN-Based Hypergraph Convolution
+
+Neighborhood hypergraph convolution:
+
+$$
+X_g^l = \Phi_l(D_v^{-1/2} H_g W_g D_e^{-1} H_g^T D_v^{-1/2} X_g^{l-1})
+$$
+
+Semantic hypergraph convolution:
+
+$$
+X_s^l = \Phi_l(\tilde{D}_v^{-1/2} H_s W_s \tilde{D}_e^{-1} H_s^T \tilde{D}_v^{-1/2} X_s^{l-1})
+$$
+
+Feature fusion:
+
+$$
+X_O = \text{Linear}(\text{Concat}(X_G, X_S))
+$$
+
+---
+
+## Algorithm 1: HyperGKAN Prediction Framework
+
+```
+Input: Historical meteorological dataset X
+Output: Prediction results P
+
+1. Construct neighborhood hypergraph GG using KNN
+2. Construct semantic hypergraph GS using feature similarity
+3. For each iteration:
+   - Apply KAN-based hypergraph convolution
+   - Compute MAE loss
+4. Output prediction results
+```
+
+---
+
+## 4. Experiments
+
+### 4.1 Experimental Setup
+
+- Dataset: WeatherBench subset (2010–2018)
+- Variables: temperature, cloud cover, humidity, wind speed
+- Input / output horizon: 12 hours
+- Optimizer: Adam
+- Loss: MAE
+- Metrics: MAE, RMSE
+
+---
+
+### 4.2 Performance Comparison
+
+HyperGKAN outperforms mainstream spatio-temporal GNNs on cloud cover and wind speed prediction, while achieving competitive results on temperature and humidity.
+
+---
+
+### 4.3 Ablation Study
+
+Ablation experiments verify the importance of each module:
+- Hypergraph convolution
+- Neighborhood hypergraph
+- Semantic hypergraph
+- KAN layers
+- Feature fusion mechanism
+
+Removing any component degrades performance.
+
+---
+
+### 4.4 Effect of Hyperedge Size
+
+The hyperedge size $K$ controls locality and high-order dependency modeling. Moderate values (e.g., $K=5$) yield optimal performance for most variables, while humidity benefits from smaller $K$ due to strong local dependencies.
+
+---
+
+## 5. Discussion
+
+Although HyperGKAN shows strong performance, dataset scale and computational overhead limit its full potential. Larger datasets and efficiency-oriented designs are promising future directions.
+
+---
+
+## 6. Conclusion
+
+This paper proposes HyperGKAN, a spatio-temporal hypergraph neural network enhanced with Kolmogorov–Arnold Networks for station-level weather forecasting. The model effectively captures high-order spatial dependencies and nonlinear dynamics, achieving superior performance in short-term forecasting tasks.
+
+Future work includes extending the model to larger-scale datasets and medium- to long-term forecasting.
+
+---
+
+## CRediT Authorship Contribution Statement
+
+- Jian Tang: Writing – original draft, review & editing  
+- Kai Ma: Writing – original draft, review & editing  
+
+---
+
+## Declaration of Competing Interest
+
+The authors declare no competing financial interests.
+
+---
+
+## Data Availability
+
+Data will be made available on request.

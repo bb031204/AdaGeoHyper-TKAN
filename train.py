@@ -47,6 +47,45 @@ from utils.visualization import plot_loss_curve, plot_metrics_curve
 logger = logging.getLogger("AdaGeoHyperTKAN")
 
 
+# ---- ANSI 终端颜色 ----
+class C:
+    """终端 ANSI 颜色码 (仅影响终端显示, 不影响日志文件)"""
+    RESET   = "\033[0m"
+    BOLD    = "\033[1m"
+    DIM     = "\033[2m"
+    RED     = "\033[91m"
+    GREEN   = "\033[92m"
+    YELLOW  = "\033[93m"
+    BLUE    = "\033[94m"
+    MAGENTA = "\033[95m"
+    CYAN    = "\033[96m"
+    WHITE   = "\033[97m"
+    BG_GREEN  = "\033[42m"
+    BG_YELLOW = "\033[43m"
+
+
+def _strip_ansi(text: str) -> str:
+    """移除 ANSI 转义序列 (用于写入日志文件)"""
+    import re
+    return re.sub(r"\033\[[0-9;]*m", "", text)
+
+
+def _log_file_only(msg: str):
+    """仅写入日志文件, 不输出到控制台 (避免和 tqdm 冲突)"""
+    for handler in logger.handlers:
+        if isinstance(handler, logging.FileHandler):
+            handler.emit(logging.LogRecord(
+                name=logger.name, level=logging.INFO, pathname="", lineno=0,
+                msg=msg, args=None, exc_info=None,
+            ))
+
+
+def tqdm_log(msg: str):
+    """同时向 tqdm 终端(带颜色) 和 logger 文件(无颜色) 输出"""
+    tqdm.write(msg)
+    _log_file_only(_strip_ansi(msg))
+
+
 def load_config(config_path: str) -> dict:
     """加载 YAML 配置文件。"""
     import yaml
@@ -178,13 +217,13 @@ def train_one_epoch(
     all_trues = []
     grad_clip = config["training"].get("grad_clip", 0)
 
-    # 使用 tqdm 进度条 (第一个 epoch 首 batch 需 CUDA warmup, 会略慢)
+    # 使用 tqdm 进度条
     pbar = tqdm(
         train_loader,
-        desc=f"  Epoch {epoch:3d} [Train]",
+        desc=f"  {C.CYAN}Epoch {epoch:3d}{C.RESET} [Train]",
         leave=False,
-        ncols=120,
-        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
+        ncols=100,
+        bar_format="{l_bar}{bar:20}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
     )
 
     for batch_idx, (x, y) in enumerate(pbar):
@@ -294,10 +333,10 @@ def evaluate(
 
     pbar = tqdm(
         data_loader,
-        desc=f"         [Val  ]",
+        desc=f"           {C.MAGENTA}[Val]{C.RESET}  ",
         leave=False,
-        ncols=120,
-        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
+        ncols=100,
+        bar_format="{l_bar}{bar:20}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
     )
 
     for x, y in pbar:
@@ -344,14 +383,25 @@ def save_checkpoint(
     best_val_loss: float,
     output_dir: str,
     is_best: bool = False,
+    train_losses: list = None,
+    val_losses: list = None,
+    val_metrics_history: dict = None,
+    no_improve_count: int = 0,
+    config: dict = None,
 ):
-    """保存 checkpoint。"""
+    """保存 checkpoint (含完整训练历史, 支持暂停恢复)。"""
     checkpoint = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
         "best_val_loss": best_val_loss,
+        # 训练历史 (用于暂停恢复)
+        "train_losses": train_losses or [],
+        "val_losses": val_losses or [],
+        "val_metrics_history": val_metrics_history or {},
+        "no_improve_count": no_improve_count,
+        "config": config,
     }
 
     # 保存最新 checkpoint
@@ -362,7 +412,7 @@ def save_checkpoint(
     if is_best:
         best_path = os.path.join(output_dir, "checkpoints", "best_model.pth")
         torch.save(checkpoint, best_path)
-        logger.info(f"[保存] 最佳模型已保存 (epoch {epoch}, val_loss={best_val_loss:.6f})")
+        _log_file_only(f"[保存] 最佳模型已保存 (epoch {epoch}, val_loss={best_val_loss:.6f})")
 
 
 def load_checkpoint(
@@ -371,36 +421,87 @@ def load_checkpoint(
     scheduler,
     checkpoint_path: str,
     device: torch.device,
-) -> int:
-    """加载 checkpoint, 返回恢复的 epoch。"""
+) -> dict:
+    """
+    加载 checkpoint, 返回恢复信息字典。
+
+    Returns:
+        dict: 包含 epoch, best_val_loss, train_losses, val_losses,
+              val_metrics_history, no_improve_count
+    """
     logger.info(f"[恢复] 从 checkpoint 恢复: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    if scheduler and checkpoint["scheduler_state_dict"]:
+    if scheduler and checkpoint.get("scheduler_state_dict"):
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
     epoch = checkpoint["epoch"]
     best_val_loss = checkpoint["best_val_loss"]
     logger.info(f"[恢复] 恢复完成: epoch={epoch}, best_val_loss={best_val_loss:.6f}")
 
-    return epoch, best_val_loss
+    return {
+        "epoch": epoch,
+        "best_val_loss": best_val_loss,
+        "train_losses": checkpoint.get("train_losses", []),
+        "val_losses": checkpoint.get("val_losses", []),
+        "val_metrics_history": checkpoint.get("val_metrics_history",
+                                              {"MAE": [], "RMSE": [], "MAPE": []}),
+        "no_improve_count": checkpoint.get("no_improve_count", 0),
+    }
 
 
-def train(config_path: str = "config.yaml"):
+def check_pause_flag(output_dir: str) -> bool:
+    """
+    检查是否收到暂停信号。
+
+    暂停信号通过 .pause 文件传递, 文件内容为目标暂停时间的时间戳。
+    当前时间 >= 目标时间时返回 True。
+    """
+    pause_flag = os.path.join(output_dir, ".pause")
+    if not os.path.exists(pause_flag):
+        return False
+    try:
+        with open(pause_flag, "r") as f:
+            target_time = float(f.read().strip())
+        return time.time() >= target_time
+    except (ValueError, OSError):
+        return False
+
+
+def clear_pause_flag(output_dir: str):
+    """清除暂停标志文件。"""
+    pause_flag = os.path.join(output_dir, ".pause")
+    if os.path.exists(pause_flag):
+        try:
+            os.remove(pause_flag)
+        except OSError:
+            pass
+
+
+def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
+          resume_output_dir: str = None):
     """
     完整训练流程入口。
 
     Args:
-        config_path: 配置文件路径
+        config_path:       配置文件路径
+        resume_checkpoint: 恢复训练的 checkpoint 路径 (由 pause_resume 系统传入)
+        resume_output_dir: 恢复训练时复用的输出目录 (由 pause_resume 系统传入)
     """
     # ---- 1. 加载配置 ----
     config = load_config(config_path)
     dataset_name = config["data"]["dataset_name"]
 
-    # ---- 2. 创建输出目录 ----
-    output_dir = create_output_dir(config)
+    # ---- 2. 创建/复用输出目录 ----
+    if resume_output_dir and os.path.isdir(resume_output_dir):
+        output_dir = resume_output_dir
+        # 确保子目录存在
+        os.makedirs(os.path.join(output_dir, "checkpoints"), exist_ok=True)
+        os.makedirs(os.path.join(output_dir, "figures"), exist_ok=True)
+    else:
+        output_dir = create_output_dir(config)
 
     # ---- 3. 设置日志 ----
     setup_logger("AdaGeoHyperTKAN", log_dir=output_dir)
@@ -487,23 +588,33 @@ def train(config_path: str = "config.yaml"):
     # ---- 12. 恢复训练 ----
     start_epoch = 1
     best_val_loss = float("inf")
+    no_improve_count = 0
+    train_losses = []
+    val_losses = []
+    val_metrics_history = {"MAE": [], "RMSE": [], "MAPE": []}
 
-    resume_path = config["output"].get("resume_from_checkpoint")
+    # 优先使用 pause_resume 传入的 checkpoint, 其次使用 config 中的
+    resume_path = resume_checkpoint or config["output"].get("resume_from_checkpoint")
     if resume_path and os.path.exists(resume_path):
-        start_epoch, best_val_loss = load_checkpoint(
+        restored = load_checkpoint(
             model, optimizer, scheduler, resume_path, device
         )
-        start_epoch += 1  # 从下一个 epoch 开始
+        start_epoch = restored["epoch"] + 1  # 从下一个 epoch 开始
+        best_val_loss = restored["best_val_loss"]
+        train_losses = restored["train_losses"]
+        val_losses = restored["val_losses"]
+        val_metrics_history = restored["val_metrics_history"]
+        no_improve_count = restored["no_improve_count"]
+        logger.info(f"[恢复] 已恢复训练历史: {len(train_losses)} epochs, "
+                    f"best_val_loss={best_val_loss:.6f}, no_improve={no_improve_count}")
+
+    # 清除可能残留的暂停标志
+    clear_pause_flag(output_dir)
 
     # ---- 13. 训练循环 ----
     epochs = config["training"]["epochs"]
     patience = config["training"].get("patience", 15)
     use_early_stop = config["training"].get("use_early_stop", True)
-    no_improve_count = 0
-
-    train_losses = []
-    val_losses = []
-    val_metrics_history = {"MAE": [], "RMSE": [], "MAPE": []}
 
     # 显存预估
     if device.type == "cuda":
@@ -520,23 +631,18 @@ def train(config_path: str = "config.yaml"):
                 f"  3. 减少 num_stations (当前 {num_st})"
             )
 
-    logger.info(f"\n{'='*60}")
-    logger.info(f"开始训练: epochs={epochs}, batch_size={config['training']['batch_size']}")
-    logger.info(f"早停: {'启用' if use_early_stop else '禁用'}, patience={patience}")
-    logger.info(f"AMP: {'启用' if use_amp else '禁用'}")
-    logger.info(f"{'='*60}")
+    tqdm_log(f"\n{'='*66}")
+    tqdm_log(f"  开始训练: epochs={epochs}, batch_size={config['training']['batch_size']}")
+    tqdm_log(f"  早停: {'启用' if use_early_stop else '禁用'}, patience={patience}")
+    tqdm_log(f"  AMP: {'启用' if use_amp else '禁用'}")
+    tqdm_log(f"{'='*66}")
     if device.type == "cuda":
-        logger.info(f"⏳ 首个 batch 需要 CUDA 内核编译 (warmup), 可能等待 1~3 分钟, 请耐心等待...")
-    logger.info("")
+        tqdm_log(f"  {C.YELLOW}⏳ 首个 batch 需 CUDA warmup, 可能等待 1~3 分钟...{C.RESET}")
+    tqdm_log("")
 
-    epoch_pbar = tqdm(
-        range(start_epoch, epochs + 1),
-        desc="🚀 Training",
-        ncols=140,
-        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} epochs [{elapsed}<{remaining}] {postfix}",
-    )
+    training_start_time = time.time()
 
-    for epoch in epoch_pbar:
+    for epoch in range(start_epoch, epochs + 1):
         epoch_start = time.time()
 
         # 训练
@@ -571,48 +677,94 @@ def train(config_path: str = "config.yaml"):
             best_val_loss = val_metrics["loss"]
             no_improve_count = 0
             if prev_best < float("inf"):
-                loss_delta = val_metrics["loss"] - prev_best  # 负数表示改善
-                best_tag = f"★ New Best (-{abs(loss_delta):.6f})"
+                loss_delta = abs(val_metrics["loss"] - prev_best)
+                best_tag = f"{C.GREEN}{C.BOLD}★ New Best (-{loss_delta:.6f}){C.RESET}"
+                best_tag_plain = f"★ New Best (-{loss_delta:.6f})"
             else:
-                best_tag = "★ New Best (first)"
+                best_tag = f"{C.GREEN}{C.BOLD}★ New Best (first){C.RESET}"
+                best_tag_plain = "★ New Best (first)"
         else:
             no_improve_count += 1
             best_tag = ""
+            best_tag_plain = ""
 
-        # 更新 epoch 进度条
-        epoch_pbar.set_postfix_str(
-            f"tl={train_metrics['loss']:.4f} vl={val_metrics['loss']:.4f} "
-            f"best={best_val_loss:.4f} lr={current_lr:.1e} "
-            f"{epoch_time:.0f}s/ep"
+        # ---- 格式化终端输出 (带颜色, 两行, 工整) ----
+        elapsed = time.time() - training_start_time
+        elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+        avg_sec_per_epoch = elapsed / (epoch - start_epoch + 1)
+        remaining_epochs = epochs - epoch
+        eta_sec = remaining_epochs * avg_sec_per_epoch
+        eta_str = time.strftime("%H:%M:%S", time.gmtime(eta_sec))
+
+        # 第一行: epoch / loss / best标记
+        line1 = (
+            f"  {C.CYAN}{C.BOLD}Epoch {epoch:3d}/{epochs}{C.RESET}"
+            f" │ Train: {C.WHITE}{train_metrics['loss']:.6f}{C.RESET}"
+            f" │ Val: {C.YELLOW}{val_metrics['loss']:.6f}{C.RESET}"
+            f" │ {C.DIM}{epoch_time:.0f}s{C.RESET}"
+            f"  {best_tag}"
+        )
+        # 第二行: 指标 / LR / 进度
+        line2 = (
+            f"  {C.DIM}         {C.RESET}"
+            f" │ MAE: {C.WHITE}{val_metrics['MAE']:.4f}{C.RESET}"
+            f" │ RMSE: {C.WHITE}{val_metrics['RMSE']:.4f}{C.RESET}"
+            f" │ MAPE: {C.WHITE}{val_metrics['MAPE']:.2f}%{C.RESET}"
+            f" │ LR: {C.DIM}{current_lr:.1e}{C.RESET}"
+            f" │ {C.DIM}[{elapsed_str}<{eta_str}]{C.RESET}"
         )
 
-        # 日志输出
-        logger.info(
+        tqdm.write(f"  {'─'*64}")
+        tqdm.write(line1)
+        tqdm.write(line2)
+
+        # 文件日志 (无颜色, 紧凑一行, 不输出到终端)
+        _log_file_only(
             f"Epoch {epoch:3d}/{epochs} | "
-            f"Train Loss: {train_metrics['loss']:.6f} | "
-            f"Val Loss: {val_metrics['loss']:.6f} | "
-            f"Val MAE: {val_metrics['MAE']:.4f} | "
-            f"Val RMSE: {val_metrics['RMSE']:.4f} | "
-            f"Val MAPE: {val_metrics['MAPE']:.2f}% | "
+            f"Train: {train_metrics['loss']:.6f} | "
+            f"Val: {val_metrics['loss']:.6f} | "
+            f"MAE: {val_metrics['MAE']:.4f} | "
+            f"RMSE: {val_metrics['RMSE']:.4f} | "
+            f"MAPE: {val_metrics['MAPE']:.2f}% | "
             f"LR: {current_lr:.2e} | "
-            f"Time: {epoch_time:.1f}s | "
-            f"{best_tag}"
+            f"{epoch_time:.0f}s | "
+            f"{best_tag_plain}"
         )
 
-        # 保存 checkpoint
-        save_checkpoint(model, optimizer, scheduler, epoch, best_val_loss, output_dir, is_best)
+        # 保存 checkpoint (含完整训练历史)
+        save_checkpoint(
+            model, optimizer, scheduler, epoch, best_val_loss, output_dir, is_best,
+            train_losses=train_losses, val_losses=val_losses,
+            val_metrics_history=val_metrics_history,
+            no_improve_count=no_improve_count, config=config,
+        )
+
+        # 暂停检查 (来自 pause_resume/pause.py 的信号)
+        if check_pause_flag(output_dir):
+            clear_pause_flag(output_dir)
+            tqdm.write(f"\n  {C.YELLOW}{'='*64}{C.RESET}")
+            tqdm.write(f"  {C.YELLOW}{C.BOLD}⏸ 暂停{C.RESET} 收到暂停信号, 已在 epoch {epoch} 结束后安全暂停")
+            tqdm.write(f"  {C.DIM}Checkpoint: {os.path.join(output_dir, 'checkpoints', 'latest.pth')}{C.RESET}")
+            tqdm.write(f"  {C.CYAN}恢复训练: python pause_resume/resume.py{C.RESET}")
+            tqdm.write(f"  {C.YELLOW}{'='*64}{C.RESET}")
+            _log_file_only(f"[暂停] 在 epoch {epoch} 安全暂停, checkpoint 已保存")
+            return output_dir, best_val_loss
 
         # 早停检查
         if use_early_stop and no_improve_count >= patience:
-            logger.info(f"\n[早停] 连续 {patience} 个 epoch 无改善, 停止训练")
+            tqdm.write(f"\n  {C.RED}[早停] 连续 {patience} 个 epoch 无改善, 停止训练{C.RESET}")
+            _log_file_only(f"[早停] 连续 {patience} 个 epoch 无改善, 停止训练")
             break
 
-    epoch_pbar.close()
-
     # ---- 14. 训练结束 ----
-    logger.info(f"\n{'='*60}")
-    logger.info(f"训练完成! 最佳 Val Loss: {best_val_loss:.6f}")
-    logger.info(f"{'='*60}")
+    total_time = time.time() - training_start_time
+    total_time_str = time.strftime("%H:%M:%S", time.gmtime(total_time))
+    tqdm.write(f"\n  {C.GREEN}{'='*64}{C.RESET}")
+    tqdm.write(f"  {C.GREEN}{C.BOLD}✓ 训练完成!{C.RESET}"
+               f"  最佳 Val Loss: {C.GREEN}{C.BOLD}{best_val_loss:.6f}{C.RESET}"
+               f"  总耗时: {C.CYAN}{total_time_str}{C.RESET}")
+    tqdm.write(f"  {C.GREEN}{'='*64}{C.RESET}")
+    _log_file_only(f"训练完成! 最佳 Val Loss: {best_val_loss:.6f}, 总耗时: {total_time_str}")
 
     # ---- 15. 可视化 ----
     fig_dir = os.path.join(output_dir, "figures")
@@ -659,6 +811,10 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="AdaGeoHyper-TKAN 训练")
     parser.add_argument("--config", type=str, default="config.yaml", help="配置文件路径")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="恢复训练的 checkpoint 路径 (由 pause_resume 系统使用)")
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help="恢复训练时复用的输出目录 (由 pause_resume 系统使用)")
     args = parser.parse_args()
 
-    train(args.config)
+    train(args.config, resume_checkpoint=args.resume, resume_output_dir=args.output_dir)
