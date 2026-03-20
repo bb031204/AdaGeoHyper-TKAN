@@ -26,12 +26,18 @@ import time
 import json
 import shutil
 import logging
+import warnings
 import numpy as np
 import torch
 import torch.nn as nn
 from datetime import datetime
 from typing import Dict, Optional
 from tqdm import tqdm
+
+warnings.filterwarnings("ignore", message=".*Not enough SMs.*")
+warnings.filterwarnings("ignore", message=".*TensorFloat32 tensor cores.*")
+logging.getLogger("torch._inductor").setLevel(logging.ERROR)
+logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
 
 # 将项目根目录加入路径
 project_root = os.path.dirname(os.path.abspath(__file__))
@@ -637,7 +643,51 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
              f" (patience={patience})"
              f"  │  AMP: {C.WHITE}{'On' if use_amp else 'Off'}{C.RESET}")
     tqdm_log(f"  {C.CYAN}{'─'*W}{C.RESET}")
-    if device.type == "cuda":
+
+    # ---- 编译 warmup: 前向 + 反向全量编译, 避免训练循环内阻塞 ----
+    _is_compiled = hasattr(model, "_orig_mod")
+    if _is_compiled and device.type == "cuda":
+        tqdm_log(f"    {C.YELLOW}⏳ torch.compile 首次编译 (前向+反向, 仅一次, 约 5~10 分钟)...{C.RESET}")
+        _warmup_start = time.time()
+
+        # 保存原始状态 (warmup 会修改权重, 完成后恢复)
+        _raw_model = getattr(model, "_orig_mod", model)
+        _saved_state = {k: v.clone() for k, v in _raw_model.state_dict().items()}
+
+        _sample_x, _sample_y = next(iter(train_loader))
+        _sample_x = _sample_x.to(device, non_blocking=True)
+        _sample_y = _sample_y.to(device, non_blocking=True)
+
+        # 1) 编译 train 前向 + 反向图
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            _warmup_pred = model(_sample_x)
+            _warmup_loss = criterion(_warmup_pred, _sample_y)
+        if use_amp and grad_scaler is not None:
+            grad_scaler.scale(_warmup_loss).backward()
+        else:
+            _warmup_loss.backward()
+
+        # 2) 编译 eval 前向图
+        model.eval()
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
+            _ = model(_sample_x)
+
+        # 3) 恢复原始模型权重和优化器 (warmup 不影响真正训练)
+        _raw_model.load_state_dict(_saved_state)
+        optimizer.zero_grad(set_to_none=True)
+        optimizer.state.clear()
+        if use_amp and grad_scaler is not None:
+            grad_scaler = torch.amp.GradScaler("cuda", enabled=True)
+
+        del _warmup_pred, _warmup_loss, _sample_x, _sample_y, _, _saved_state
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        _warmup_sec = time.time() - _warmup_start
+        tqdm_log(f"    {C.GREEN}✓ 编译完成 ({_warmup_sec:.0f}s), 后续 epoch 无需重复编译{C.RESET}")
+    elif device.type == "cuda":
         tqdm_log(f"    {C.YELLOW}⏳ 首个 batch 需 CUDA warmup, 可能等待 1~3 分钟...{C.RESET}")
     tqdm_log("")
 
@@ -700,9 +750,9 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         line1 = (
             f"  {C.CYAN}{C.BOLD}Epoch {epoch:3d}/{epochs}{C.RESET}"
             f"  {C.DIM}│{C.RESET}"
-            f"  Train {C.WHITE}{train_metrics['loss']:.6f}{C.RESET}"
+            f"  Train Loss: {C.WHITE}{train_metrics['loss']:.6f}{C.RESET}"
             f"  {C.DIM}│{C.RESET}"
-            f"  Val {C.YELLOW}{val_metrics['loss']:.6f}{C.RESET}"
+            f"  Val Loss: {C.YELLOW}{val_metrics['loss']:.6f}{C.RESET}"
             f"  {C.DIM}│{C.RESET}"
             f"  {C.DIM}{epoch_time:.0f}s{C.RESET}"
             f"  {best_tag}"
@@ -710,11 +760,11 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         line2 = (
             f"          "
             f"  {C.DIM}│{C.RESET}"
-            f"  MAE {C.WHITE}{val_metrics['MAE']:.4f}{C.RESET}"
-            f"  RMSE {C.WHITE}{val_metrics['RMSE']:.4f}{C.RESET}"
-            f"  MAPE {C.WHITE}{val_metrics['MAPE']:.2f}%{C.RESET}"
+            f"  MAE: {C.WHITE}{val_metrics['MAE']:.4f}{C.RESET}"
+            f"  RMSE: {C.WHITE}{val_metrics['RMSE']:.4f}{C.RESET}"
+            f"  MAPE: {C.WHITE}{val_metrics['MAPE']:.2f}%{C.RESET}"
             f"  {C.DIM}│{C.RESET}"
-            f"  LR {C.DIM}{current_lr:.1e}{C.RESET}"
+            f"  LR: {C.DIM}{current_lr:.1e}{C.RESET}"
             f"  {C.DIM}│{C.RESET}"
             f"  {C.DIM}[{elapsed_str}<{eta_str}]{C.RESET}"
         )

@@ -1,0 +1,62 @@
+[2026-03-20 22:48:37] [INFO] 日志文件: D:/bishe/AdaGeoHyper-TKAN/outputs\20260320_224837_temperature\train_20260320_224837.log
+[2026-03-20 22:48:37] [INFO] ============================================================
+[2026-03-20 22:48:37] [INFO] AdaGeoHyper-TKAN 训练启动
+[2026-03-20 22:48:37] [INFO] ============================================================
+[2026-03-20 22:48:37] [INFO] 数据集: temperature
+[2026-03-20 22:48:37] [INFO] 输出目录: D:/bishe/AdaGeoHyper-TKAN/outputs\20260320_224837_temperature
+[2026-03-20 22:48:37] [INFO] [种子] 随机种子设置为 42 (cudnn.benchmark=True, TF32=high)
+[2026-03-20 22:48:37] [INFO] [设备] GPU: NVIDIA GeForce RTX 5070 Laptop GPU, 显存: 8.0GB
+[2026-03-20 22:48:37] [INFO] [配置] 配置快照已保存: D:/bishe/AdaGeoHyper-TKAN/outputs\20260320_224837_temperature\config_snapshot.yaml
+[2026-03-20 22:48:37] [INFO] [数据] 数据目录: D:/bishe/WYB\temperature
+[2026-03-20 22:48:39] [INFO] [Data] Context disabled
+[2026-03-20 22:48:39] [INFO] [Data] Station sampling: 2048 -> 1200
+[2026-03-20 22:48:39] [INFO] [Data] Using context altitude channel for graph, range=[-28.95, 4910.14]
+[2026-03-20 22:48:39] [INFO] [Data] Loading trn: D:/bishe/WYB\temperature\trn.pkl
+[2026-03-20 22:48:42] [INFO] [Data] Station sampling by fixed indices: 1200
+[2026-03-20 22:48:42] [INFO] [Data] Final trn: x=(2300, 12, 1200, 1), y=(2300, 12, 1200, 1)
+[2026-03-20 22:48:43] [INFO] [Data] Loading val: D:/bishe/WYB\temperature\val.pkl
+[2026-03-20 22:48:43] [INFO] [Data] Station sampling by fixed indices: 1200
+[2026-03-20 22:48:43] [INFO] [Data] Final val: x=(329, 12, 1200, 1), y=(329, 12, 1200, 1)
+[2026-03-20 22:48:43] [INFO] [Data] Loading test: D:/bishe/WYB\temperature\test.pkl
+[2026-03-20 22:48:44] [INFO] [Data] Station sampling by fixed indices: 1200
+[2026-03-20 22:48:44] [INFO] [Data] Final test: x=(657, 12, 1200, 1), y=(657, 12, 1200, 1)
+[2026-03-20 22:48:44] [INFO] [Data] Loading positions: D:/bishe/WYB\temperature\position.pkl
+[2026-03-20 22:48:44] [INFO] [Data] Positions with altitude (context channel 5), shape=(1200, 3)
+[2026-03-20 22:48:44] [INFO] [Data] Data loading done
+[2026-03-20 22:48:44] [INFO]   Train samples: 2300
+[2026-03-20 22:48:44] [INFO]   Val samples: 329
+[2026-03-20 22:48:44] [INFO]   Test samples: 657
+[2026-03-20 22:48:44] [INFO]   Stations: 1200, input_dim=1, target_dim=1
+[2026-03-20 22:48:44] [INFO]   Position dim: 3
+[2026-03-20 22:48:44] [INFO] [模型] AdaGeoHyperTKAN 初始化完成:
+[2026-03-20 22:48:44] [INFO]   输入: [B, 12, N, 1]
+[2026-03-20 22:48:44] [INFO]   输出: [B, 12, N, 1]
+[2026-03-20 22:48:44] [INFO]   hidden_dim=64, tkan_hidden=64
+[2026-03-20 22:48:44] [INFO]   tkan_layers=2, hypergraph_layers=2
+[2026-03-20 22:48:44] [INFO]   k_neighbors=8
+[2026-03-20 22:48:44] [INFO] [模型] 模型参数量: 381,453 (可训练: 381,453)
+[2026-03-20 22:48:44] [INFO] [超图] ========== 超图构建信息 ==========
+[2026-03-20 22:48:44] [INFO] [超图] 位置维度: 3D (lonlat_alt) -> 经度(lon) + 纬度(lat) + 海拔(alt)
+[2026-03-20 22:48:44] [INFO] [超图] 站点数: 1200, K近邻: 8
+[2026-03-20 22:48:44] [INFO] [超图] λ_geo=1.0, λ_alt=0.5
+[2026-03-20 22:48:44] [INFO] [超图] 未命中缓存, 开始构图 (lonlat_alt)...
+[2026-03-20 22:48:44] [INFO] [超图] 构图完成: 站点数=1200, K=8, 超边数=1200, 耗时=0.13s
+[2026-03-20 22:48:44] [INFO] [超图] 平均邻居距离: 729.83km, 最大距离: 1968.55km
+[2026-03-20 22:48:44] [INFO] [超图] 缓存已保存:
+[2026-03-20 22:48:44] [INFO] [超图]   路径: d:\bishe\AdaGeoHyper-TKAN\cache\hypergraph_lonlat_alt_7033afcfd501e7103da502a60b8a866c.pkl
+[2026-03-20 22:48:44] [INFO] [超图]   文件: hypergraph_lonlat_alt_7033afcfd501e7103da502a60b8a866c.pkl
+[2026-03-20 22:48:44] [INFO] [超图]   构建维度: 3D (lonlat_alt) -> 经度(lon) + 纬度(lat) + 海拔(alt)
+[2026-03-20 22:48:44] [INFO] [超图] ========== 超图就绪 ==========
+[2026-03-20 22:48:44] [INFO] [超图] N=1200, K=8, edges=1200, dim=3D (经度(lon) + 纬度(lat) + 海拔(alt))
+[2026-03-20 22:48:47] [INFO] [Compile] torch.compile 已启用 (inductor backend)
+[2026-03-20 22:48:47] [INFO] [AMP] 混合精度训练已启用 (float16)
+[2026-03-20 22:48:47] [INFO] [显存] 预估峰值: ~0.3GB, GPU 可用: 8.0GB
+[2026-03-20 22:48:47] [INFO] 
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[2026-03-20 22:48:47] [INFO]                                   TRAINING                                
+[2026-03-20 22:48:47] [INFO]   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[2026-03-20 22:48:47] [INFO]     Epochs: 50  │  Batch: 16  │  Early Stop: On (patience=15)  │  AMP: On
+[2026-03-20 22:48:47] [INFO]   ────────────────────────────────────────────────────────────────────────
+[2026-03-20 22:48:47] [INFO]     ⏳ torch.compile 首次编译 (前向+反向, 仅一次, 约 5~10 分钟)...
+[2026-03-20 23:00:30] [INFO]     ✓ 编译完成 (703s), 后续 epoch 无需重复编译
+[2026-03-20 23:00:30] [INFO] 
