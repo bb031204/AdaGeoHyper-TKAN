@@ -131,26 +131,42 @@ def build_knn_hypergraph(
     return sorted_indices, sorted_dists
 
 
+def get_position_dim_tag(position_dim: int) -> str:
+    """根据位置维度返回可读标签。"""
+    if position_dim >= 3:
+        return "lonlat_alt"
+    return "lonlat"
+
+
 def get_cache_key(
     dataset_name: str,
     num_stations: int,
     k_neighbors: int,
     lambda_geo: float,
     lambda_alt: float,
+    position_dim: int = 2,
     station_indices: Optional[np.ndarray] = None,
-) -> str:
-    """生成超图缓存键值。"""
+) -> Tuple[str, str]:
+    """
+    生成超图缓存键值。
+
+    Returns:
+        (cache_hash, dim_tag): 哈希值和维度标签
+    """
     key_data = {
         "dataset": dataset_name,
         "num_stations": num_stations,
         "k_neighbors": k_neighbors,
         "lambda_geo": lambda_geo,
         "lambda_alt": lambda_alt,
+        "position_dim": position_dim,
     }
     if station_indices is not None:
         key_data["station_hash"] = hashlib.md5(station_indices.tobytes()).hexdigest()
     key_str = json.dumps(key_data, sort_keys=True)
-    return hashlib.md5(key_str.encode()).hexdigest()
+    cache_hash = hashlib.md5(key_str.encode()).hexdigest()
+    dim_tag = get_position_dim_tag(position_dim)
+    return cache_hash, dim_tag
 
 
 class AdaptiveScorer(nn.Module):
@@ -303,7 +319,28 @@ class AdaptiveGeoHypergraph(nn.Module):
             station_indices: 站点采样索引
         """
         N = positions.shape[0]
+        actual_pos_dim = positions.shape[1]
         k = min(self.k_neighbors, N - 1)
+        dim_tag = get_position_dim_tag(actual_pos_dim)
+
+        # ---- 维度自检 ----
+        has_alt = actual_pos_dim >= 3
+        dim_desc_parts = ["经度(lon)", "纬度(lat)"]
+        if has_alt:
+            dim_desc_parts.append("海拔(alt)")
+        dim_desc = " + ".join(dim_desc_parts)
+
+        logger.info(f"[超图] ========== 超图构建信息 ==========")
+        logger.info(f"[超图] 位置维度: {actual_pos_dim}D ({dim_tag}) -> {dim_desc}")
+        logger.info(f"[超图] 站点数: {N}, K近邻: {k}")
+        logger.info(f"[超图] λ_geo={self.lambda_geo}, λ_alt={self.lambda_alt}"
+                    f"{'' if has_alt else ' (未生效: 无海拔数据)'}")
+
+        if actual_pos_dim != self.position_dim:
+            logger.warning(
+                f"[超图] 维度不匹配! 模型 position_dim={self.position_dim}, "
+                f"实际数据维度={actual_pos_dim}. 将以实际数据维度为准."
+            )
 
         cache_hit = False
         cache_path = None
@@ -311,22 +348,29 @@ class AdaptiveGeoHypergraph(nn.Module):
         # ---- 尝试加载缓存 ----
         if use_cache and cache_dir is not None:
             os.makedirs(cache_dir, exist_ok=True)
-            cache_key = get_cache_key(
-                dataset_name, N, k, self.lambda_geo, self.lambda_alt, station_indices
+            cache_hash, _ = get_cache_key(
+                dataset_name, N, k, self.lambda_geo, self.lambda_alt,
+                actual_pos_dim, station_indices,
             )
-            cache_path = os.path.join(cache_dir, f"hypergraph_{cache_key}.pkl")
+            cache_filename = f"hypergraph_{dim_tag}_{cache_hash}.pkl"
+            cache_path = os.path.join(cache_dir, cache_filename)
 
             if os.path.exists(cache_path):
-                logger.info(f"[超图] 命中缓存: {cache_path}")
                 with open(cache_path, "rb") as f:
                     cached = pickle.load(f)
                 neighbor_indices = cached["neighbor_indices"]
+                cached_dim = cached.get("position_dim", "unknown")
+                cached_dim_tag = cached.get("dim_tag", "unknown")
                 cache_hit = True
-                logger.info(f"[超图] 从缓存加载成功, 站点数={N}, K={k}")
+                logger.info(f"[超图] 命中缓存:")
+                logger.info(f"[超图]   路径: {cache_path}")
+                logger.info(f"[超图]   文件: {cache_filename}")
+                logger.info(f"[超图]   构建维度: {cached_dim}D ({cached_dim_tag})")
+                logger.info(f"[超图]   站点数={N}, K={k}")
 
         # ---- 构建超图 ----
         if not cache_hit:
-            logger.info(f"[超图] 未命中缓存, 开始构图...")
+            logger.info(f"[超图] 未命中缓存, 开始构图 ({dim_tag})...")
             t_start = time.time()
 
             distances = compute_geographic_distance(positions, self.lambda_geo, self.lambda_alt)
@@ -342,33 +386,40 @@ class AdaptiveGeoHypergraph(nn.Module):
                 f"最大距离: {neighbor_dists[:, -1].max():.2f}km"
             )
 
-            # 保存缓存
+            # 保存缓存 (含维度元信息)
             if use_cache and cache_path is not None:
                 with open(cache_path, "wb") as f:
                     pickle.dump({
                         "neighbor_indices": neighbor_indices,
                         "neighbor_dists": neighbor_dists,
+                        "position_dim": actual_pos_dim,
+                        "dim_tag": dim_tag,
+                        "dim_desc": dim_desc,
+                        "lambda_geo": self.lambda_geo,
+                        "lambda_alt": self.lambda_alt,
+                        "num_stations": N,
+                        "k_neighbors": k,
                     }, f)
-                logger.info(f"[超图] 缓存已保存: {cache_path}")
+                logger.info(f"[超图] 缓存已保存:")
+                logger.info(f"[超图]   路径: {cache_path}")
+                logger.info(f"[超图]   文件: {os.path.basename(cache_path)}")
+                logger.info(f"[超图]   构建维度: {actual_pos_dim}D ({dim_tag}) -> {dim_desc}")
 
         # ---- 注册为 buffer ----
         self.neighbor_indices = torch.from_numpy(neighbor_indices).long()
-        # neighbor_indices: [N, K+1]
 
-        # 位置 tensor (用于打分函数)
         self.positions_tensor = torch.from_numpy(positions).float()
-        # positions_tensor: [N, position_dim]
 
-        # 将 buffer 移至模型所在设备 (build_graph 可能在 model.to(device) 之后调用)
         try:
             device = next(self.parameters()).device
             self.neighbor_indices = self.neighbor_indices.to(device)
             self.positions_tensor = self.positions_tensor.to(device)
         except StopIteration:
-            pass  # 无参数时保持 CPU
+            pass
 
         self._graph_built = True
-        logger.info(f"[超图] 超图结构已就绪 (N={N}, K={k}, edges={N})")
+        logger.info(f"[超图] ========== 超图就绪 ==========")
+        logger.info(f"[超图] N={N}, K={k}, edges={N}, dim={actual_pos_dim}D ({dim_desc})")
 
     def _compute_state_summary(self, x: torch.Tensor) -> torch.Tensor:
         """

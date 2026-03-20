@@ -1,51 +1,33 @@
-"""
-DataLoader: 数据加载与预处理模块
-================================
-
-负责读取 pkl 格式数据集, 构建 PyTorch DataLoader。
-
-数据集格式 (基于现有数据):
-- trn.pkl / val.pkl / test.pkl:
-  dict with keys: 'x', 'y' (可能有 'context')
-  x shape: (num_samples, 12, num_stations, num_channels)
-  y shape: (num_samples, 12, num_stations, num_channels)
-
-- position.pkl:
-  dict with key: 'lonlat'
-  lonlat shape: (num_stations, 2)  [经度, 纬度]
-  可能有额外的 'alt' / 'altitude' 键
-
-数据集说明:
-- temperature:       单通道 (C=1)
-- humidity:          单通道 (C=1)
-- cloud_cover:       单通道 (C=1)
-- component_of_wind: 双通道 (C=2, u风和v风)
-"""
-
 import os
 import pickle
 import logging
+from typing import Optional, Tuple, List, Dict
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from typing import Optional, Tuple, List, Dict
 
 logger = logging.getLogger(__name__)
 
 
+CONTEXT_FEATURE_ORDER = [
+    "year",      # 0
+    "month",     # 1
+    "day",       # 2
+    "time",      # 3 (time index in window)
+    "region",    # 4 (land coverage / land-sea mask-like feature)
+    "altitude",  # 5
+    "latitude",  # 6
+    "longitude", # 7
+]
+
+
 class StandardScaler:
-    """
-    标准化工具 (零均值单位方差)
-
-    与现有工程 lib.utils.StandardScaler 兼容。
-    """
-
     def __init__(self, mean: float = 0.0, std: float = 1.0):
         self.mean = mean
         self.std = std
 
     def fit(self, data: np.ndarray):
-        """从数据中计算 mean 和 std。"""
         self.mean = float(np.mean(data))
         self.std = float(np.std(data))
         return self
@@ -53,8 +35,7 @@ class StandardScaler:
     def transform(self, data: np.ndarray) -> np.ndarray:
         return (data - self.mean) / (self.std + 1e-8)
 
-    def inverse_transform(self, data) -> np.ndarray:
-        """反标准化, 支持 numpy 和 torch。"""
+    def inverse_transform(self, data):
         if isinstance(data, torch.Tensor):
             return data * self.std + self.mean
         return data * self.std + self.mean
@@ -63,26 +44,33 @@ class StandardScaler:
         return f"StandardScaler(mean={self.mean:.4f}, std={self.std:.4f})"
 
 
+def resolve_context_indices(context_features: Optional[Dict[str, bool]]) -> Tuple[List[int], List[str]]:
+    """
+    Parse config flags to selected context channel indices.
+
+    Supported keys:
+      use_year/use_month/use_day/use_time/use_region/use_altitude/use_longitude/use_latitude
+    """
+    if context_features is None:
+        return [], []
+
+    key_map = {
+        "use_year": 0,
+        "use_month": 1,
+        "use_day": 2,
+        "use_time": 3,
+        "use_region": 4,
+        "use_altitude": 5,
+        "use_latitude": 6,
+        "use_longitude": 7,
+    }
+
+    selected = [idx for key, idx in key_map.items() if bool(context_features.get(key, False))]
+    selected_names = [CONTEXT_FEATURE_ORDER[i] for i in selected]
+    return selected, selected_names
+
+
 class WeatherDataset(Dataset):
-    """
-    气象时空数据集
-
-    基于现有 dataloader.py 的 Dataset 类改写,
-    适配 AdaGeoHyper-TKAN 模型输入。
-
-    数据格式:
-        x: (num_samples, 12, num_stations, C)  输入
-        y: (num_samples, 12, num_stations, C)  标签
-
-    Args:
-        data_dir:    数据集目录 (如 D:/bishe/WYB/temperature)
-        mode:        'trn', 'val', 'test'
-        scaler:      StandardScaler 列表 (每个通道一个)
-        sample_ratio: 样本抽样比例
-        num_stations: 站点抽样数 (None=全部)
-        station_indices: 指定的站点索引 (优先于 num_stations)
-    """
-
     def __init__(
         self,
         data_dir: str,
@@ -91,73 +79,88 @@ class WeatherDataset(Dataset):
         sample_ratio: float = 1.0,
         num_stations: Optional[int] = None,
         station_indices: Optional[np.ndarray] = None,
+        include_context: bool = False,
+        context_indices: Optional[List[int]] = None,
     ):
         super().__init__()
         self.data_dir = data_dir
         self.mode = mode
+        self.include_context = include_context
+        self.context_indices = context_indices or []
 
-        # ---- 读取数据 ----
         pkl_path = os.path.join(data_dir, f"{mode}.pkl")
-        logger.info(f"[数据] 加载 {mode} 集: {pkl_path}")
+        logger.info(f"[Data] Loading {mode}: {pkl_path}")
 
         with open(pkl_path, "rb") as f:
             data = pickle.load(f)
 
-        self.x = data["x"]  # (N_samples, 12, N_stations, C)
-        self.y = data["y"]  # (N_samples, 12, N_stations, C)
+        x = data["x"]
+        y = data["y"]
+        context = None
+        if self.include_context and len(self.context_indices) > 0:
+            if "context" not in data:
+                raise KeyError(
+                    f"{mode}.pkl has no 'context' but include_context=true and context_indices={self.context_indices}"
+                )
+            context = data["context"]
 
-        logger.info(f"[数据] {mode} 集原始: x={self.x.shape}, y={self.y.shape}, dtype={self.x.dtype}")
-
-        # ---- 站点采样 ----
+        # station sampling
+        self._station_indices = None
         if station_indices is not None:
-            self.x = self.x[:, :, station_indices, :]
-            self.y = self.y[:, :, station_indices, :]
-            logger.info(f"[数据] 站点采样 (指定索引): {len(station_indices)} 个站点")
-        elif num_stations is not None and num_stations < self.x.shape[2]:
-            total_stations = self.x.shape[2]
-            indices = np.random.choice(total_stations, num_stations, replace=False)
-            indices.sort()
-            self.x = self.x[:, :, indices, :]
-            self.y = self.y[:, :, indices, :]
-            logger.info(f"[数据] 站点采样: {total_stations} -> {num_stations}")
-            self._station_indices = indices
-        else:
-            self._station_indices = None
+            x = x[:, :, station_indices, :]
+            y = y[:, :, station_indices, :]
+            if context is not None:
+                context = context[:, :, station_indices, :]
+            logger.info(f"[Data] Station sampling by fixed indices: {len(station_indices)}")
+        elif num_stations is not None and num_stations < x.shape[2]:
+            total_stations = x.shape[2]
+            idx = np.random.choice(total_stations, num_stations, replace=False)
+            idx.sort()
+            x = x[:, :, idx, :]
+            y = y[:, :, idx, :]
+            if context is not None:
+                context = context[:, :, idx, :]
+            self._station_indices = idx
+            logger.info(f"[Data] Station sampling: {total_stations} -> {num_stations}")
 
-        # ---- 样本抽样 ----
+        # sample sampling
         if sample_ratio < 1.0:
-            total_samples = self.x.shape[0]
+            total_samples = x.shape[0]
             n_samples = max(1, int(total_samples * sample_ratio))
-            indices = np.random.choice(total_samples, n_samples, replace=False)
-            indices.sort()
-            self.x = self.x[indices]
-            self.y = self.y[indices]
-            logger.info(f"[数据] 样本抽样: {total_samples} -> {n_samples} (ratio={sample_ratio})")
+            idx = np.random.choice(total_samples, n_samples, replace=False)
+            idx.sort()
+            x = x[idx]
+            y = y[idx]
+            if context is not None:
+                context = context[idx]
+            logger.info(f"[Data] Sample sampling: {total_samples} -> {n_samples} (ratio={sample_ratio})")
 
-        # ---- 标准化 ----
+        # standardize meteorological channels only
         self.scaler = scaler
         if scaler is not None:
-            feature_len = self.x.shape[-1]
-            for i in range(feature_len):
-                self.x[..., i] = scaler[i].transform(self.x[..., i])
-                self.y[..., i] = scaler[i].transform(self.y[..., i])
-            logger.info(f"[数据] 标准化完成, 通道数={feature_len}")
+            target_dim = y.shape[-1]
+            for i in range(target_dim):
+                x[..., i] = scaler[i].transform(x[..., i])
+                y[..., i] = scaler[i].transform(y[..., i])
 
-        # 转为 float32
-        self.x = self.x.astype(np.float32)
-        self.y = self.y.astype(np.float32)
+        # concat selected context channels to x only
+        if context is not None and len(self.context_indices) > 0:
+            context_dim = context.shape[-1]
+            if max(self.context_indices) >= context_dim:
+                raise IndexError(
+                    f"context dimension={context_dim}, requested indices={self.context_indices}"
+                )
+            x = np.concatenate([x, context[..., self.context_indices]], axis=-1)
+            logger.info(f"[Data] Context concat enabled, x channels -> {x.shape[-1]}, indices={self.context_indices}")
 
-        logger.info(f"[数据] {mode} 集最终: x={self.x.shape}, y={self.y.shape}")
+        self.x = x.astype(np.float32)
+        self.y = y.astype(np.float32)
+        logger.info(f"[Data] Final {mode}: x={self.x.shape}, y={self.y.shape}")
 
     def __len__(self) -> int:
         return self.x.shape[0]
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-            x: [12, N_stations, C]
-            y: [12, N_stations, C]
-        """
         return torch.from_numpy(self.x[idx]), torch.from_numpy(self.y[idx])
 
 
@@ -165,62 +168,79 @@ def load_positions(
     data_dir: str,
     num_stations: Optional[int] = None,
     station_indices: Optional[np.ndarray] = None,
+    context_altitude: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, int]:
     """
-    加载站点位置信息。
-
-    Args:
-        data_dir:        数据集目录
-        num_stations:    站点数 (用于采样)
-        station_indices: 指定站点索引
-
-    Returns:
-        positions: [N, 2] 或 [N, 3] (lon, lat[, alt])
-        position_dim: 位置维度 (2 或 3)
+    Altitude source priority:
+      1) position.pkl keys: alt/altitude/elev/elevation
+      2) context channel 5 passed by caller
     """
     position_file = os.path.join(data_dir, "position.pkl")
-    logger.info(f"[数据] 加载位置信息: {position_file}")
+    logger.info(f"[Data] Loading positions: {position_file}")
 
     with open(position_file, "rb") as f:
         pos_data = pickle.load(f)
 
-    # 提取经纬度
     if "lonlat" in pos_data:
-        lonlat = pos_data["lonlat"]  # [N, 2]
+        lonlat = pos_data["lonlat"]
     elif "position" in pos_data:
         lonlat = pos_data["position"]
     else:
-        raise KeyError(f"position.pkl 中未找到 'lonlat' 或 'position' 键, 可用键: {list(pos_data.keys())}")
+        raise KeyError(f"position.pkl missing 'lonlat'/'position', keys={list(pos_data.keys())}")
+    full_station_count = lonlat.shape[0]
 
-    # 提取海拔 (可选)
     alt = None
+    alt_source = None
     for alt_key in ["alt", "altitude", "elev", "elevation"]:
         if alt_key in pos_data:
             alt = pos_data[alt_key]
+            alt_source = f"position.pkl[{alt_key}]"
             break
 
-    # 构建 positions 数组
+    if alt is None and context_altitude is not None:
+        alt = context_altitude
+        alt_source = "context channel 5"
+
+    # Keep lon/lat and altitude aligned before concatenation.
+    # This handles the case where context_altitude is already sampled
+    # by station_indices but lonlat is still full-station.
+    if station_indices is not None:
+        lonlat = lonlat[station_indices]
+        if alt is not None:
+            if alt.ndim == 1:
+                if alt.shape[0] == len(station_indices):
+                    pass
+                elif alt.shape[0] == full_station_count:
+                    alt = alt[station_indices]
+                else:
+                    raise ValueError(
+                        f"Altitude length {alt.shape[0]} does not match full stations or sampled stations "
+                        f"(sampled={len(station_indices)})"
+                    )
+            else:
+                if alt.shape[0] == len(station_indices):
+                    pass
+                elif alt.shape[0] == full_station_count:
+                    alt = alt[station_indices]
+                else:
+                    raise ValueError(
+                        f"Altitude first dimension {alt.shape[0]} does not match full stations or sampled stations "
+                        f"(sampled={len(station_indices)})"
+                    )
+
     if alt is not None:
         if alt.ndim == 1:
             alt = alt[:, None]
         positions = np.concatenate([lonlat, alt], axis=-1).astype(np.float64)
         position_dim = 3
-        logger.info(f"[数据] 位置信息: lon/lat + altitude, shape={positions.shape}")
+        logger.info(f"[Data] Positions with altitude ({alt_source}), shape={positions.shape}")
     else:
         positions = lonlat.astype(np.float64)
         position_dim = 2
-        logger.info(f"[数据] 位置信息: lon/lat (无海拔), shape={positions.shape}")
+        logger.info(f"[Data] Positions lon/lat only, shape={positions.shape}")
 
-    # 站点采样
-    if station_indices is not None:
-        positions = positions[station_indices]
-    elif num_stations is not None and num_stations < positions.shape[0]:
-        # 此处假设采样索引在 dataset 中已确定, 这里需要传入
-        logger.warning("[数据] 位置采样: 需要使用相同的 station_indices!")
-
-    logger.info(f"[数据] 最终位置: {positions.shape}, "
-                f"lon范围=[{positions[:, 0].min():.2f}, {positions[:, 0].max():.2f}], "
-                f"lat范围=[{positions[:, 1].min():.2f}, {positions[:, 1].max():.2f}]")
+    if station_indices is None and num_stations is not None and num_stations < positions.shape[0]:
+        logger.warning("[Data] Position sampling needs same station_indices for strict alignment")
 
     return positions, position_dim
 
@@ -233,88 +253,103 @@ def create_data_loaders(
     val_sample_ratio: float = 1.0,
     test_sample_ratio: float = 1.0,
     seed: int = 42,
+    include_context: bool = False,
+    context_features: Optional[Dict[str, bool]] = None,
+    use_context_altitude: bool = True,
 ) -> Dict:
-    """
-    创建完整的数据加载管道。
-
-    Args:
-        data_dir:         数据集目录
-        batch_size:       批大小
-        num_stations:     站点采样数
-        sample_ratio:     训练集样本抽样比例
-        val_sample_ratio: 验证集样本抽样比例
-        test_sample_ratio: 测试集样本抽样比例
-        seed:             随机种子
-
-    Returns:
-        dict with keys:
-            'train_loader', 'val_loader', 'test_loader',
-            'scaler', 'positions', 'position_dim',
-            'feature_dim', 'station_indices', 'num_stations'
-    """
     np.random.seed(seed)
 
-    # ---- 读取训练集确定标准化参数 ----
     trn_path = os.path.join(data_dir, "trn.pkl")
     with open(trn_path, "rb") as f:
         trn_raw = pickle.load(f)
 
-    train_x = trn_raw["x"]  # (N, 12, N_stations, C)
-    feature_dim = train_x.shape[-1]
+    train_x = trn_raw["x"]  # (N, T, Stations, C_target)
+    target_dim = train_x.shape[-1]
     total_stations = train_x.shape[2]
 
-    logger.info(f"[数据] 特征维度: {feature_dim}, 总站点数: {total_stations}")
+    context_indices, context_feature_names = resolve_context_indices(context_features)
+    if include_context and len(context_indices) > 0:
+        if "context" not in trn_raw:
+            raise KeyError("include_context=true but trn.pkl has no 'context'")
+        context_dim = trn_raw["context"].shape[-1]
+        if max(context_indices) >= context_dim:
+            raise IndexError(f"context dim={context_dim}, requested indices={context_indices}")
+        input_feature_dim = target_dim + len(context_indices)
+        logger.info(
+            f"[Data] Context enabled: {context_feature_names} (indices={context_indices}), "
+            f"input channels {target_dim} -> {input_feature_dim}"
+        )
+    else:
+        input_feature_dim = target_dim
+        logger.info("[Data] Context disabled")
 
-    # ---- 站点采样 ----
+    # station sampling indices fixed for all splits
     station_indices = None
     actual_stations = total_stations
     if num_stations is not None and num_stations < total_stations:
-        station_indices = np.sort(
-            np.random.choice(total_stations, num_stations, replace=False)
-        )
+        station_indices = np.sort(np.random.choice(total_stations, num_stations, replace=False))
         actual_stations = num_stations
-        logger.info(f"[数据] 站点采样: {total_stations} -> {num_stations}")
+        logger.info(f"[Data] Station sampling: {total_stations} -> {num_stations}")
 
-    # ---- 计算标准化参数 (基于训练集) ----
-    if station_indices is not None:
-        train_data_for_scaler = train_x[:, :, station_indices, :]
-    else:
-        train_data_for_scaler = train_x
-
+    # scaler from target channels only
+    train_data_for_scaler = train_x[:, :, station_indices, :] if station_indices is not None else train_x
     scaler = []
-    for i in range(feature_dim):
+    for i in range(target_dim):
         ch_data = train_data_for_scaler[..., i]
         sc = StandardScaler(mean=float(ch_data.mean()), std=float(ch_data.std()))
         scaler.append(sc)
-        logger.info(f"[数据] 通道{i} Scaler: {sc}")
+
+    # optional altitude from context channel 5 for hypergraph
+    context_altitude = None
+    if use_context_altitude:
+        if "context" in trn_raw and trn_raw["context"].shape[-1] > 5:
+            context_altitude = trn_raw["context"][0, 0, :, 5].astype(np.float64)
+            if station_indices is not None:
+                context_altitude = context_altitude[station_indices]
+            logger.info(
+                f"[Data] Using context altitude channel for graph, range=[{context_altitude.min():.2f}, {context_altitude.max():.2f}]"
+            )
+        else:
+            logger.warning("[Data] use_context_altitude=true but context channel 5 not available")
 
     del trn_raw, train_x, train_data_for_scaler
 
-    # ---- 创建 Dataset ----
     train_set = WeatherDataset(
-        data_dir, mode="trn", scaler=scaler,
-        sample_ratio=sample_ratio, station_indices=station_indices,
+        data_dir,
+        mode="trn",
+        scaler=scaler,
+        sample_ratio=sample_ratio,
+        station_indices=station_indices,
+        include_context=include_context,
+        context_indices=context_indices,
     )
     val_set = WeatherDataset(
-        data_dir, mode="val", scaler=scaler,
-        sample_ratio=val_sample_ratio, station_indices=station_indices,
+        data_dir,
+        mode="val",
+        scaler=scaler,
+        sample_ratio=val_sample_ratio,
+        station_indices=station_indices,
+        include_context=include_context,
+        context_indices=context_indices,
     )
     test_set = WeatherDataset(
-        data_dir, mode="test", scaler=scaler,
-        sample_ratio=test_sample_ratio, station_indices=station_indices,
+        data_dir,
+        mode="test",
+        scaler=scaler,
+        sample_ratio=test_sample_ratio,
+        station_indices=station_indices,
+        include_context=include_context,
+        context_indices=context_indices,
     )
 
-    # ---- 创建 DataLoader ----
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
-                              num_workers=0, pin_memory=True, drop_last=False)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False,
-                            num_workers=0, pin_memory=True, drop_last=False)
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False,
-                             num_workers=0, pin_memory=True, drop_last=False)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True, drop_last=False)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True, drop_last=False)
+    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True, drop_last=False)
 
-    # ---- 加载位置信息 ----
     positions, position_dim = load_positions(
-        data_dir, station_indices=station_indices
+        data_dir,
+        station_indices=station_indices,
+        context_altitude=context_altitude,
     )
 
     result = {
@@ -324,16 +359,21 @@ def create_data_loaders(
         "scaler": scaler,
         "positions": positions,
         "position_dim": position_dim,
-        "feature_dim": feature_dim,
+        "input_feature_dim": input_feature_dim,
+        "target_dim": target_dim,
+        "feature_dim": target_dim,
         "station_indices": station_indices,
         "num_stations": actual_stations,
+        "include_context": include_context,
+        "context_indices": context_indices,
+        "context_feature_names": context_feature_names,
     }
 
-    logger.info(f"[数据] 数据加载完成:")
-    logger.info(f"  训练集: {len(train_set)} 样本")
-    logger.info(f"  验证集: {len(val_set)} 样本")
-    logger.info(f"  测试集: {len(test_set)} 样本")
-    logger.info(f"  站点数: {actual_stations}, 特征维度: {feature_dim}")
-    logger.info(f"  位置维度: {position_dim}")
+    logger.info("[Data] Data loading done")
+    logger.info(f"  Train samples: {len(train_set)}")
+    logger.info(f"  Val samples: {len(val_set)}")
+    logger.info(f"  Test samples: {len(test_set)}")
+    logger.info(f"  Stations: {actual_stations}, input_dim={input_feature_dim}, target_dim={target_dim}")
+    logger.info(f"  Position dim: {position_dim}")
 
     return result

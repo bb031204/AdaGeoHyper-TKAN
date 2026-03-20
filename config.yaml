@@ -1,66 +1,76 @@
 # ================================================================
-# AdaGeoHyper-TKAN 项目配置文件
+# AdaGeoHyper-TKAN 配置文件
 # 用于多站点气象时空序列预测
 # ================================================================
 
-# ---- 数据相关 ----
+# ---- 数据配置 ----
 data:
-  dataset_name: "temperature"   
- # dataset_name: "cloud_cover"  
- # dataset_name: "humidity"   
- # dataset_name: "component_of_wind"          # 可选: temperature / cloud_cover / humidity / component_of_wind
+  dataset_name: "temperature"
+  # dataset_name: "cloud_cover"
+  # dataset_name: "humidity"
+  # dataset_name: "component_of_wind"  # 可选: temperature / cloud_cover / humidity / component_of_wind
   data_root: "D:/bishe/WYB"            # 数据根目录
   input_len: 12                         # 输入时间步长
   pred_len: 12                          # 预测时间步长
-  num_stations: 1024                    # null=使用全部站点(2048)，或指定如 512, 1024  ← 服务器上改为 null (全部2048站点, 空间信息更完整)
-  sample_ratio: 0.5                     # 训练集样本抽样比例 (0~1)  ← 服务器上改为 1.0 (使用全部训练样本)
-  val_sample_ratio: 1.0                 # 验证集样本抽样比例
-  test_sample_ratio: 1.0               # 测试集样本抽样比例
-  include_context: false                # 是否使用 context 特征
+  num_stations: 1024                    # null=使用全部站点(2048); 也可设为 512/1024
+  sample_ratio: 0.5                     # 训练集样本采样比例 (0~1)
+  val_sample_ratio: 1.0                 # 验证集样本采样比例
+  test_sample_ratio: 1.0                # 测试集样本采样比例
+  include_context: false                # 是否启用 context 特征拼接到模型输入
+  context_features:
+    use_year: true                      # 年
+    use_month: true                     # 月
+    use_day: true                       # 日
+    use_time: false                     # 时间窗内索引
+    use_region: false                   # 陆地覆盖比例/陆海掩码类特征 (0~1)
+    use_altitude: false                 # 海拔
+    use_longitude: false                # 经度
+    use_latitude: false                 # 纬度
 
-# ---- 超图相关 ----
+# ---- 超图配置 ----
 hypergraph:
   k_neighbors: 8                        # K近邻数量
   lambda_geo: 1.0                       # 地理平面距离权重
   lambda_alt: 0.5                       # 海拔差权重
+  use_context_altitude: true            # position.pkl 无海拔时，是否用 context 第5通道作为海拔
   use_hypergraph_cache: true            # 是否使用超图缓存
   cache_dir: "cache"                    # 缓存目录
   summary_pool: "mean"                  # 状态摘要方式: mean / last / linear
-  scorer_hidden_dim: 32                 # 打分函数隐藏维度
+  scorer_hidden_dim: 32                 # 打分网络隐藏维度
 
-# ---- 模型相关 ----
+# ---- 模型配置 ----
 model:
   hidden_dim: 64                        # 空间模块隐藏维度
   tkan_hidden_dim: 64                   # TKAN 隐藏维度
   tkan_layers: 2                        # TKAN 层数
-  tkan_sub_kan_configs: [null, 3]       # TKAN 子 KAN 配置 (null=默认, int=spline_order)
-  dropout: 0.1                          # Dropout 比率
+  tkan_sub_kan_configs: [null, 3]       # TKAN 子KAN配置 (null=默认, int=spline_order)
+  dropout: 0.1                          # Dropout 比例
   fusion_dim: 64                        # 融合层维度
   kan_grid_size: 5                      # KAN B-spline 网格大小
   kan_spline_order: 3                   # KAN B-spline 阶数
   hypergraph_layers: 2                  # 超图卷积层数
-  tkan_chunk_size: 0                    # TKAN分块 (0=不分块, >0如4096=限制单次B*N)
-  use_gradient_checkpoint: false        # 梯度检查点 (极端省显存, 训练变慢)
+  tkan_chunk_size: 0                    # TKAN 分块 (0=不分块, >0 例如 4096)
+  use_gradient_checkpoint: false        # 是否启用梯度检查点以节省显存
 
-# ---- 训练相关 ----
+# ---- 训练配置 ----
 training:
-  batch_size: 16                        # 批大小 (8GB显存建议16)  ← 服务器上改为 32 或 64 (更大batch梯度更稳定)
-  epochs: 50                           # 最大训练轮数
+  batch_size: 16                        # 批大小
+  epochs: 50                            # 训练轮数
   learning_rate: 0.001                  # 学习率
   weight_decay: 0.0001                  # 权重衰减
-  device: "cuda"                        # cuda(优先GPU) / auto / cpu
+  device: "cuda"                        # cuda / auto / cpu
   seed: 42                              # 随机种子
   patience: 15                          # 早停耐心值
-  use_early_stop: true                  # 是否使用早停
+  use_early_stop: true                  # 是否启用早停
   scheduler: "cosine"                   # 学习率调度: cosine / step / none
   scheduler_step_size: 20               # StepLR 步长
   scheduler_gamma: 0.5                  # StepLR 衰减因子
   grad_clip: 1.0                        # 梯度裁剪阈值
-  use_amp: true                         # 混合精度训练 (GPU推荐, 显存减半)  ← 服务器显存充裕时可改为 false (全精度训练, 精度更高)
+  use_amp: true                         # 是否启用 AMP 混合精度
 
-# ---- 输出相关 ----
+# ---- 输出配置 ----
 output:
   output_dir: "D:/bishe/AdaGeoHyper-TKAN/outputs"  # 输出目录
   save_best_only: true                  # 是否只保存最佳模型
-  resume_from_checkpoint: null          # 恢复训练的 checkpoint 路径 (null=不恢复)
+  resume_from_checkpoint: null          # 恢复训练checkpoint路径, null表示不恢复
   log_interval: 10                      # 每多少个 batch 打印一次日志

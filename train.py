@@ -38,6 +38,12 @@ project_root = os.path.dirname(os.path.abspath(__file__))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+# Avoid UnicodeEncodeError on Windows GBK terminals.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(errors="replace")
+
 from models.ada_geo_hyper_tkan import AdaGeoHyperTKAN
 from utils.data_loader import create_data_loaders, StandardScaler
 from utils.metrics import compute_metrics, compute_per_step_metrics
@@ -140,12 +146,12 @@ def set_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    logger.info(f"[种子] 随机种子设置为 {seed}")
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+    logger.info(f"[种子] 随机种子设置为 {seed} (cudnn.benchmark=True)")
 
 
-def build_model(config: dict, feature_dim: int, position_dim: int, device: torch.device) -> AdaGeoHyperTKAN:
+def build_model(config: dict, input_feature_dim: int, target_dim: int, position_dim: int, device: torch.device) -> AdaGeoHyperTKAN:
     """根据配置构建模型。"""
     model_cfg = config["model"]
     data_cfg = config["data"]
@@ -156,8 +162,8 @@ def build_model(config: dict, feature_dim: int, position_dim: int, device: torch
     # YAML 中 null 会被解析为 None, int 保持原样
 
     model = AdaGeoHyperTKAN(
-        input_dim=feature_dim,
-        output_dim=feature_dim,   # 输出维度与输入一致
+        input_dim=input_feature_dim,
+        output_dim=target_dim,
         hidden_dim=model_cfg["hidden_dim"],
         tkan_hidden_dim=model_cfg["tkan_hidden_dim"],
         tkan_layers=model_cfg["tkan_layers"],
@@ -201,45 +207,35 @@ def train_one_epoch(
     grad_scaler: Optional[torch.amp.GradScaler] = None,
 ) -> Dict[str, float]:
     """
-    训练一个 epoch。
-
-    Args:
-        use_amp:      是否使用 AMP 混合精度
-        grad_scaler:  AMP GradScaler 实例
+    训练一个 epoch（只追踪 loss，不做逐 batch 指标收集以避免 GPU 同步开销）。
 
     Returns:
-        dict: {'loss': ..., 'MAE': ..., 'RMSE': ..., 'MAPE': ...}
+        dict: {'loss': ...}
     """
     model.train()
     total_loss = 0.0
     num_batches = 0
-    all_preds = []
-    all_trues = []
     grad_clip = config["training"].get("grad_clip", 0)
 
-    # 使用 tqdm 进度条
     pbar = tqdm(
         train_loader,
-        desc=f"  {C.CYAN}Epoch {epoch:3d}{C.RESET} [Train]",
+        desc=f"    {C.CYAN}Train{C.RESET}",
         leave=False,
-        ncols=100,
-        bar_format="{l_bar}{bar:20}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
+        ncols=120,
+        bar_format="{l_bar}{bar:35}{r_bar}",
     )
 
     for batch_idx, (x, y) in enumerate(pbar):
-        # x: [B, 12, N, F], y: [B, 12, N, F]
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
 
         try:
-            # 前向传播 (AMP autocast)
             with torch.amp.autocast("cuda", enabled=use_amp):
-                pred = model(x)  # [B, 12, N, C]
+                pred = model(x)
                 loss = criterion(pred, y)
 
-            # 反向传播 (AMP scale)
             if use_amp and grad_scaler is not None:
                 grad_scaler.scale(loss).backward()
                 if grad_clip > 0:
@@ -272,39 +268,13 @@ def train_one_epoch(
         total_loss += loss.item()
         num_batches += 1
 
-        # 更新进度条信息
         avg_loss = total_loss / num_batches
-        postfix_dict = {"loss": f"{avg_loss:.4f}"}
-        if device.type == "cuda":
-            mem_used = torch.cuda.memory_allocated() / 1024**3
-            postfix_dict["GPU"] = f"{mem_used:.1f}GB"
-        pbar.set_postfix(postfix_dict)
-
-        # 收集用于指标计算的数据 (反标准化)
-        with torch.no_grad():
-            # AMP autocast 下 pred 可能是 float16, 需转 float32
-            pred_np = pred.detach().float().cpu().numpy()
-            true_np = y.detach().float().cpu().numpy()
-
-            # 反标准化
-            for ch in range(pred_np.shape[-1]):
-                pred_np[..., ch] = scaler_list[ch].inverse_transform(pred_np[..., ch])
-                true_np[..., ch] = scaler_list[ch].inverse_transform(true_np[..., ch])
-
-            all_preds.append(pred_np)
-            all_trues.append(true_np)
+        pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
 
     pbar.close()
 
     avg_loss = total_loss / max(num_batches, 1)
-
-    # 计算指标
-    all_preds = np.concatenate(all_preds, axis=0)
-    all_trues = np.concatenate(all_trues, axis=0)
-    metrics = compute_metrics(all_preds, all_trues)
-    metrics["loss"] = avg_loss
-
-    return metrics
+    return {"loss": avg_loss}
 
 
 @torch.no_grad()
@@ -333,10 +303,10 @@ def evaluate(
 
     pbar = tqdm(
         data_loader,
-        desc=f"           {C.MAGENTA}[Val]{C.RESET}  ",
+        desc=f"    {C.MAGENTA}Val  {C.RESET}",
         leave=False,
-        ncols=100,
-        bar_format="{l_bar}{bar:20}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
+        ncols=120,
+        bar_format="{l_bar}{bar:35}{r_bar}",
     )
 
     for x, y in pbar:
@@ -532,6 +502,9 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         val_sample_ratio=config["data"].get("val_sample_ratio", 1.0),
         test_sample_ratio=config["data"].get("test_sample_ratio", 1.0),
         seed=config["training"]["seed"],
+        include_context=config["data"].get("include_context", False),
+        context_features=config["data"].get("context_features", {}),
+        use_context_altitude=config["hypergraph"].get("use_context_altitude", True),
     )
 
     train_loader = data["train_loader"]
@@ -539,10 +512,11 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
     scaler_list = data["scaler"]
     positions = data["positions"]
     position_dim = data["position_dim"]
-    feature_dim = data["feature_dim"]
+    input_feature_dim = data.get("input_feature_dim", data.get("feature_dim"))
+    target_dim = data.get("target_dim", data.get("feature_dim"))
 
     # ---- 8. 构建模型 ----
-    model = build_model(config, feature_dim, position_dim, device)
+    model = build_model(config, input_feature_dim, target_dim, position_dim, device)
 
     # ---- 9. 构建超图 ----
     cache_dir = os.path.join(project_root, config["hypergraph"]["cache_dir"])
@@ -609,7 +583,11 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
                     f"best_val_loss={best_val_loss:.6f}, no_improve={no_improve_count}")
 
     # 清除可能残留的暂停标志
-    clear_pause_flag(output_dir)
+    preserve_pause_flag = os.environ.get("ADAGEO_PRESERVE_PAUSE_FLAG", "0") == "1"
+    if preserve_pause_flag:
+        logger.info("[暂停] preserve .pause flag on start (ADAGEO_PRESERVE_PAUSE_FLAG=1)")
+    else:
+        clear_pause_flag(output_dir)
 
     # ---- 13. 训练循环 ----
     epochs = config["training"]["epochs"]
@@ -631,13 +609,17 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
                 f"  3. 减少 num_stations (当前 {num_st})"
             )
 
-    tqdm_log(f"\n{'='*66}")
-    tqdm_log(f"  开始训练: epochs={epochs}, batch_size={config['training']['batch_size']}")
-    tqdm_log(f"  早停: {'启用' if use_early_stop else '禁用'}, patience={patience}")
-    tqdm_log(f"  AMP: {'启用' if use_amp else '禁用'}")
-    tqdm_log(f"{'='*66}")
+    W = 72
+    tqdm_log(f"\n  {C.CYAN}{'━'*W}{C.RESET}")
+    tqdm_log(f"  {C.CYAN}{C.BOLD}{'TRAINING':^{W}}{C.RESET}")
+    tqdm_log(f"  {C.CYAN}{'━'*W}{C.RESET}")
+    tqdm_log(f"    Epochs: {C.WHITE}{epochs}{C.RESET}  │  Batch: {C.WHITE}{config['training']['batch_size']}{C.RESET}"
+             f"  │  Early Stop: {C.WHITE}{'On' if use_early_stop else 'Off'}{C.RESET}"
+             f" (patience={patience})"
+             f"  │  AMP: {C.WHITE}{'On' if use_amp else 'Off'}{C.RESET}")
+    tqdm_log(f"  {C.CYAN}{'─'*W}{C.RESET}")
     if device.type == "cuda":
-        tqdm_log(f"  {C.YELLOW}⏳ 首个 batch 需 CUDA warmup, 可能等待 1~3 分钟...{C.RESET}")
+        tqdm_log(f"    {C.YELLOW}⏳ 首个 batch 需 CUDA warmup, 可能等待 1~3 分钟...{C.RESET}")
     tqdm_log("")
 
     training_start_time = time.time()
@@ -677,18 +659,18 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
             best_val_loss = val_metrics["loss"]
             no_improve_count = 0
             if prev_best < float("inf"):
-                loss_delta = abs(val_metrics["loss"] - prev_best)
-                best_tag = f"{C.GREEN}{C.BOLD}★ New Best (-{loss_delta:.6f}){C.RESET}"
-                best_tag_plain = f"★ New Best (-{loss_delta:.6f})"
+                loss_delta = prev_best - val_metrics["loss"]
+                best_tag = f"{C.GREEN}{C.BOLD}New Best{C.RESET} ({C.GREEN}-{loss_delta:.6f}{C.RESET})"
+                best_tag_plain = f"New Best (-{loss_delta:.6f})"
             else:
-                best_tag = f"{C.GREEN}{C.BOLD}★ New Best (first){C.RESET}"
-                best_tag_plain = "★ New Best (first)"
+                best_tag = f"{C.GREEN}{C.BOLD}New Best{C.RESET}"
+                best_tag_plain = "New Best"
         else:
             no_improve_count += 1
             best_tag = ""
             best_tag_plain = ""
 
-        # ---- 格式化终端输出 (带颜色, 两行, 工整) ----
+        # ---- 格式化终端输出 ----
         elapsed = time.time() - training_start_time
         elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
         avg_sec_per_epoch = elapsed / (epoch - start_epoch + 1)
@@ -696,25 +678,29 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         eta_sec = remaining_epochs * avg_sec_per_epoch
         eta_str = time.strftime("%H:%M:%S", time.gmtime(eta_sec))
 
-        # 第一行: epoch / loss / best标记
         line1 = (
             f"  {C.CYAN}{C.BOLD}Epoch {epoch:3d}/{epochs}{C.RESET}"
-            f" │ Train: {C.WHITE}{train_metrics['loss']:.6f}{C.RESET}"
-            f" │ Val: {C.YELLOW}{val_metrics['loss']:.6f}{C.RESET}"
-            f" │ {C.DIM}{epoch_time:.0f}s{C.RESET}"
+            f"  {C.DIM}│{C.RESET}"
+            f"  Train {C.WHITE}{train_metrics['loss']:.6f}{C.RESET}"
+            f"  {C.DIM}│{C.RESET}"
+            f"  Val {C.YELLOW}{val_metrics['loss']:.6f}{C.RESET}"
+            f"  {C.DIM}│{C.RESET}"
+            f"  {C.DIM}{epoch_time:.0f}s{C.RESET}"
             f"  {best_tag}"
         )
-        # 第二行: 指标 / LR / 进度
         line2 = (
-            f"  {C.DIM}         {C.RESET}"
-            f" │ MAE: {C.WHITE}{val_metrics['MAE']:.4f}{C.RESET}"
-            f" │ RMSE: {C.WHITE}{val_metrics['RMSE']:.4f}{C.RESET}"
-            f" │ MAPE: {C.WHITE}{val_metrics['MAPE']:.2f}%{C.RESET}"
-            f" │ LR: {C.DIM}{current_lr:.1e}{C.RESET}"
-            f" │ {C.DIM}[{elapsed_str}<{eta_str}]{C.RESET}"
+            f"          "
+            f"  {C.DIM}│{C.RESET}"
+            f"  MAE {C.WHITE}{val_metrics['MAE']:.4f}{C.RESET}"
+            f"  RMSE {C.WHITE}{val_metrics['RMSE']:.4f}{C.RESET}"
+            f"  MAPE {C.WHITE}{val_metrics['MAPE']:.2f}%{C.RESET}"
+            f"  {C.DIM}│{C.RESET}"
+            f"  LR {C.DIM}{current_lr:.1e}{C.RESET}"
+            f"  {C.DIM}│{C.RESET}"
+            f"  {C.DIM}[{elapsed_str}<{eta_str}]{C.RESET}"
         )
 
-        tqdm.write(f"  {'─'*64}")
+        tqdm.write(f"\n  {C.DIM}{'─' * W}{C.RESET}")
         tqdm.write(line1)
         tqdm.write(line2)
 
@@ -742,28 +728,34 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         # 暂停检查 (来自 pause_resume/pause.py 的信号)
         if check_pause_flag(output_dir):
             clear_pause_flag(output_dir)
-            tqdm.write(f"\n  {C.YELLOW}{'='*64}{C.RESET}")
-            tqdm.write(f"  {C.YELLOW}{C.BOLD}⏸ 暂停{C.RESET} 收到暂停信号, 已在 epoch {epoch} 结束后安全暂停")
-            tqdm.write(f"  {C.DIM}Checkpoint: {os.path.join(output_dir, 'checkpoints', 'latest.pth')}{C.RESET}")
-            tqdm.write(f"  {C.CYAN}恢复训练: python pause_resume/resume.py{C.RESET}")
-            tqdm.write(f"  {C.YELLOW}{'='*64}{C.RESET}")
+            tqdm.write(f"\n  {C.YELLOW}{'━' * W}{C.RESET}")
+            tqdm.write(f"  {C.YELLOW}{C.BOLD}{'PAUSED':^{W}}{C.RESET}")
+            tqdm.write(f"  {C.YELLOW}{'─' * W}{C.RESET}")
+            tqdm.write(f"    收到暂停信号, 已在 epoch {epoch} 结束后安全暂停")
+            tqdm.write(f"    {C.DIM}Checkpoint: {os.path.join(output_dir, 'checkpoints', 'latest.pth')}{C.RESET}")
+            tqdm.write(f"    {C.CYAN}恢复训练: python pause_resume/resume.py{C.RESET}")
+            tqdm.write(f"  {C.YELLOW}{'━' * W}{C.RESET}")
             _log_file_only(f"[暂停] 在 epoch {epoch} 安全暂停, checkpoint 已保存")
             return output_dir, best_val_loss
 
         # 早停检查
         if use_early_stop and no_improve_count >= patience:
-            tqdm.write(f"\n  {C.RED}[早停] 连续 {patience} 个 epoch 无改善, 停止训练{C.RESET}")
+            tqdm.write(f"\n  {C.DIM}{'─' * W}{C.RESET}")
+            tqdm.write(f"  {C.RED}{C.BOLD}  Early Stop  {C.RESET}"
+                       f"  连续 {patience} 个 epoch 无改善, 停止训练")
             _log_file_only(f"[早停] 连续 {patience} 个 epoch 无改善, 停止训练")
             break
 
     # ---- 14. 训练结束 ----
     total_time = time.time() - training_start_time
     total_time_str = time.strftime("%H:%M:%S", time.gmtime(total_time))
-    tqdm.write(f"\n  {C.GREEN}{'='*64}{C.RESET}")
-    tqdm.write(f"  {C.GREEN}{C.BOLD}✓ 训练完成!{C.RESET}"
-               f"  最佳 Val Loss: {C.GREEN}{C.BOLD}{best_val_loss:.6f}{C.RESET}"
-               f"  总耗时: {C.CYAN}{total_time_str}{C.RESET}")
-    tqdm.write(f"  {C.GREEN}{'='*64}{C.RESET}")
+    tqdm.write(f"\n  {C.GREEN}{'━' * W}{C.RESET}")
+    tqdm.write(f"  {C.GREEN}{C.BOLD}{'TRAINING COMPLETE':^{W}}{C.RESET}")
+    tqdm.write(f"  {C.GREEN}{'─' * W}{C.RESET}")
+    tqdm.write(f"    Best Val Loss: {C.GREEN}{C.BOLD}{best_val_loss:.6f}{C.RESET}"
+               f"    Total Time: {C.CYAN}{total_time_str}{C.RESET}"
+               f"    Epochs: {C.WHITE}{epoch}/{epochs}{C.RESET}")
+    tqdm.write(f"  {C.GREEN}{'━' * W}{C.RESET}")
     _log_file_only(f"训练完成! 最佳 Val Loss: {best_val_loss:.6f}, 总耗时: {total_time_str}")
 
     # ---- 15. 可视化 ----

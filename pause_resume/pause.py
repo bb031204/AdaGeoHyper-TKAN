@@ -33,6 +33,25 @@ project_root = os.path.dirname(current_dir)
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+# Avoid UnicodeEncodeError on Windows GBK terminals.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(errors="replace")
+
+
+_ORIG_PRINT = print
+
+
+def print(*args, **kwargs):
+    sanitized = []
+    for arg in args:
+        text = str(arg)
+        text = text.replace("✓", "[OK]").replace("✗", "[ERROR]").replace("⏰", "[TIMER]").replace("•", "-")
+        text = text.replace("⚠️", "[WARN]").replace("⚠", "[WARN]")
+        sanitized.append(text)
+    return _ORIG_PRINT(*sanitized, **kwargs)
+
 
 def find_latest_run(outputs_dir: str = "outputs"):
     """查找最新的训练目录"""
