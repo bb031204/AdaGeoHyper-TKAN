@@ -67,6 +67,7 @@ training:
   scheduler_gamma: 0.5                  # StepLR 衰减因子
   grad_clip: 1.0                        # 梯度裁剪阈值
   use_amp: true                         # 是否启用 AMP 混合精度
+  use_compile: true                     # 是否启用 torch.compile 编译加速 (需 PyTorch 2.0+)
 
 # ---- 输出配置 ----
 output:

@@ -204,16 +204,24 @@ D:/bishe/WYB/
 
 ### 数据格式说明
 
-**trn.pkl / val.pkl / test.pkl**（Python pickle 字典）:
+**trn.pkl / val.pkl / test.pkl** (Python pickle dictionary):
 
 ```python
 {
-    'x': np.ndarray,  # shape: (num_samples, 12, 2048, C)  — 输入序列
-    'y': np.ndarray,  # shape: (num_samples, 12, 2048, C)  — 目标序列
+    'x': np.ndarray,        # shape: (num_samples, 12, 2048, C_target)
+    'y': np.ndarray,        # shape: (num_samples, 12, 2048, C_target)
+    'context': np.ndarray,  # shape: (num_samples, 12, 2048, C_context) (optional)
 }
-# C=1 (温度/湿度/云量) 或 C=2 (风速 u,v)
-# 12 = 时间步数，2048 = 全球站点数
+# C_target=1 (temperature/humidity/cloud_cover) or C_target=2 (wind u,v)
+# C_context usually includes: year/month/day/time/region/altitude/latitude/longitude
+# 12 = time steps, 2048 = total stations
 ```
+
+> Notes:
+> - `x/y` are target meteorological channels.
+> - `context` supports two paths:
+>   1) concatenate selected context channels to `x` via `include_context/context_features`;
+>   2) provide altitude fallback for hypergraph when `position.pkl` has no altitude (`context[..., 5]`), controlled by `use_context_altitude`.
 
 **position.pkl**（站点经纬度信息）:
 
@@ -322,29 +330,61 @@ python main.py --dataset temperature --device cuda --batch_size 64 --epochs 200 
 
 ```yaml
 data:
-  dataset_name: "temperature"     # 数据集: temperature/humidity/cloud_cover/component_of_wind
-  data_root: "D:/bishe/WYB"      # 数据根目录
-  input_len: 12                   # 输入时间步长 (历史观测窗口)
-  pred_len: 12                    # 预测时间步长 (未来预测窗口)
-  num_stations: null              # 站点采样数 (null=全部2048, 或 256/512/1024)
-  sample_ratio: 1.0               # 训练集样本抽样比例 (0.1~1.0, 用于快速调试)
-  val_sample_ratio: 1.0           # 验证集抽样比例
-  test_sample_ratio: 1.0          # 测试集抽样比例
-  include_context: false          # 是否使用辅助 context 特征 (暂未启用)
+  dataset_name: "temperature"
+  data_root: "D:/bishe/WYB"
+  input_len: 12
+  pred_len: 12
+  num_stations: null
+  sample_ratio: 1.0
+  val_sample_ratio: 1.0
+  test_sample_ratio: 1.0
+
+  # 是否将 context 特征拼接到 x 输入通道
+  include_context: false
+
+  # 选择参与拼接的 context 通道（按需开启）
+  context_features:
+    use_year: false
+    use_month: false
+    use_day: false
+    use_time: false
+    use_region: false
+    use_altitude: false
+    use_latitude: false
+    use_longitude: false
 ```
 
 ### hypergraph — 超图配置
 
 ```yaml
 hypergraph:
-  k_neighbors: 8                  # K 近邻数量 (推荐 6~12)
-  lambda_geo: 1.0                 # Haversine 球面距离权重
-  lambda_alt: 0.5                 # 海拔差权重 (设为 0 则仅用平面距离)
-  use_hypergraph_cache: true      # 是否缓存超图结构 (首次构建后加速)
-  cache_dir: "cache"              # 缓存目录
-  summary_pool: "mean"            # 站点状态摘要方式: mean/last/linear
-  scorer_hidden_dim: 32           # 自适应打分函数 MLP 隐藏维度
+  k_neighbors: 8
+  lambda_geo: 1.0
+  lambda_alt: 0.5
+
+  # 若 position.pkl 无 alt/altitude/elev/elevation，
+  # 可回退使用 context 第 5 通道（altitude）构图
+  use_context_altitude: true
+
+  use_hypergraph_cache: true
+  cache_dir: "cache"
+  summary_pool: "mean"
+  scorer_hidden_dim: 32
 ```
+
+### Context Features
+
+The current version supports two context paths:
+
+1. Input feature augmentation (for both training and prediction)
+- Enable `data.include_context: true`.
+- Channels selected by `data.context_features` are concatenated to the last dimension of `x`.
+- Example: `x` changes from `[B, 12, N, 1]` to `[B, 12, N, 6]` when 5 context channels are enabled.
+- `y` shape does not change; it still contains only target meteorological channels.
+
+2. Altitude fallback for hypergraph construction
+- Hypergraph first reads altitude from `position.pkl` (`alt/altitude/elev/elevation`).
+- If missing and `hypergraph.use_context_altitude: true`, it falls back to `context[..., 5]`.
 
 ### model — 模型配置
 
@@ -407,7 +447,7 @@ output:
    ├── 可选: 站点采样 (num_stations)
    └── 可选: 样本抽样 (sample_ratio)
 8. 构建 AdaGeoHyperTKAN 模型 → 移至 GPU
-9. 构建超图结构 (基于站点经纬度, 可缓存加速)
+9. Build hypergraph (lon/lat + altitude; altitude from position.pkl or context channel-5), with cache acceleration
 10. 初始化 Adam 优化器 + 学习率调度器
 11. 训练循环 (每个 epoch):
     ├── 训练: MSE 损失 + 梯度裁剪 + 反标准化指标

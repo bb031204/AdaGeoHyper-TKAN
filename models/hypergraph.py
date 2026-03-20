@@ -527,30 +527,14 @@ class AdaptiveGeoHypergraph(nn.Module):
         # 将时间步展开: [B*T, N, F_in]
         h = x.reshape(B * T, N, F_in)
 
+        # 预计算循环外常量 (避免重复 reshape/expand)
+        nbr_idx_flat = nbr_idx.reshape(-1)
+        w_bt = weights.unsqueeze(1).expand(-1, T, -1, -1).reshape(B * T, N, K_plus_1, 1)
+
         for layer_idx in range(self.num_layers):
-            # 收集邻居特征
-            # h: [B*T, N, D_in]
-            D_in = h.shape[-1]
-
-            # 邻居特征: 使用 index_select + reshape
-            # nbr_idx: [N, K+1], 值域 [0, N)
-            nbr_features = h[:, nbr_idx.reshape(-1), :].reshape(B * T, N, K_plus_1, D_in)
-            # nbr_features: [B*T, N, K+1, D_in]
-
-            # 权重扩展到时间步: [B, N, K+1] -> [B*T, N, K+1]
-            w = weights.unsqueeze(1).expand(-1, T, -1, -1).reshape(B * T, N, K_plus_1)
-            # w: [B*T, N, K+1]
-
-            # 加权聚合
-            w_expanded = w.unsqueeze(-1)  # [B*T, N, K+1, 1]
-            aggregated = (nbr_features * w_expanded).sum(dim=2)
-            # aggregated: [B*T, N, D_in]
-
-            # 线性变换
+            nbr_features = h[:, nbr_idx_flat, :].reshape(B * T, N, K_plus_1, -1)
+            aggregated = (nbr_features * w_bt).sum(dim=2)
             h = self.conv_layers[layer_idx](aggregated)
-            # h: [B*T, N, D]
-
-            # LayerNorm + 激活 + Dropout
             h = self.layer_norms[layer_idx](h)
             h = self.activation(h)
             h = self.dropout_layer(h)

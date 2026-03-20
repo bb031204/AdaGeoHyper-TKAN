@@ -148,7 +148,8 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
-    logger.info(f"[种子] 随机种子设置为 {seed} (cudnn.benchmark=True)")
+    torch.set_float32_matmul_precision("high")
+    logger.info(f"[种子] 随机种子设置为 {seed} (cudnn.benchmark=True, TF32=high)")
 
 
 def build_model(config: dict, input_feature_dim: int, target_dim: int, position_dim: int, device: torch.device) -> AdaGeoHyperTKAN:
@@ -360,9 +361,11 @@ def save_checkpoint(
     config: dict = None,
 ):
     """保存 checkpoint (含完整训练历史, 支持暂停恢复)。"""
+    # torch.compile 包装后的模型, 取原始模块的 state_dict 以保持兼容性
+    raw_model = getattr(model, "_orig_mod", model)
     checkpoint = {
         "epoch": epoch,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": raw_model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
         "best_val_loss": best_val_loss,
@@ -547,6 +550,22 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
             step_size=config["training"].get("scheduler_step_size", 20),
             gamma=config["training"].get("scheduler_gamma", 0.5),
         )
+
+    # ---- 10.5 torch.compile 编译加速 ----
+    if config["training"].get("use_compile", True) and device.type == "cuda":
+        _can_compile = True
+        try:
+            import triton  # noqa: F401
+        except ImportError:
+            _can_compile = False
+            logger.warning("[Compile] Triton 未安装, 跳过 torch.compile "
+                           "(pip install triton-windows 可启用)")
+        if _can_compile:
+            try:
+                model = torch.compile(model)
+                logger.info("[Compile] torch.compile 已启用 (inductor backend)")
+            except Exception as e:
+                logger.warning(f"[Compile] torch.compile 不可用, 跳过: {e}")
 
     # ---- 11. 损失函数 ----
     criterion = nn.MSELoss()

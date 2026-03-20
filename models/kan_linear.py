@@ -155,7 +155,8 @@ class KANLinear(nn.Module):
         spline_basis = self._compute_bspline_basis(x_flat)
         # spline_basis: [B_flat, in_features, num_basis]
         # spline_weight: [out_features, in_features, num_basis]
-        spline_output = torch.einsum("bik,oik->bo", spline_basis, self.spline_weight)
+        # 展平为矩阵乘法 (比 einsum 更高效)
+        spline_output = spline_basis.reshape(x_flat.shape[0], -1) @ self.spline_weight.reshape(self.out_features, -1).t()
         # spline_output: [B_flat, out_features]
 
         # ---- 合并输出 ----
