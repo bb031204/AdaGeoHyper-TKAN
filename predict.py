@@ -74,6 +74,7 @@ def load_best_model(
         summary_pool=hyper_cfg["summary_pool"],
         scorer_hidden_dim=hyper_cfg["scorer_hidden_dim"],
         degree_clamp_min=hyper_cfg.get("degree_clamp_min", 1e-6),
+        float32_norm=hyper_cfg.get("float32_norm", False),
         hypergraph_layers=model_cfg["hypergraph_layers"],
         fusion_dim=model_cfg["fusion_dim"],
         dropout=model_cfg["dropout"],
@@ -106,7 +107,8 @@ def predict_on_test(
     model: nn.Module,
     test_loader,
     device: torch.device,
-    scaler_list,
+    weather_scaler,
+    target_weather_dim: int,
     use_amp: bool = False,
 ):
     """在测试集上执行预测并反标准化。"""
@@ -123,12 +125,14 @@ def predict_on_test(
 
         pred_np = pred.float().cpu().numpy()
         true_np = y.float().cpu().numpy()
-        for ch in range(pred_np.shape[-1]):
-            pred_np[..., ch] = scaler_list[ch].inverse_transform(pred_np[..., ch])
-            true_np[..., ch] = scaler_list[ch].inverse_transform(true_np[..., ch])
+        pred_weather = pred_np[..., :target_weather_dim]
+        true_weather = true_np[..., :target_weather_dim]
+        if weather_scaler is not None:
+            pred_weather = weather_scaler.inverse_transform(pred_weather)
+            true_weather = weather_scaler.inverse_transform(true_weather)
 
-        all_preds.append(pred_np)
-        all_trues.append(true_np)
+        all_preds.append(pred_weather)
+        all_trues.append(true_weather)
 
     predictions = np.concatenate(all_preds, axis=0)
     ground_truth = np.concatenate(all_trues, axis=0)
@@ -188,6 +192,7 @@ def predict(output_dir: str, config_path: str = None):
     config["data"]["element"] = element_name
     config["hypergraph"]["k_neighbors"] = int(element_settings["k"])
     config["hypergraph"]["degree_clamp_min"] = float(element_settings.get("degree_clamp_min", 1e-6))
+    config["hypergraph"]["float32_norm"] = bool(element_settings.get("float32_norm", False))
     dataset_name = config["data"]["dataset_name"]
 
     setup_logger("AdaGeoHyperTKAN", log_dir=output_dir)
@@ -197,7 +202,8 @@ def predict(output_dir: str, config_path: str = None):
     logger.info(f"数据集: {dataset_name}")
     logger.info(
         f"要素: {element_name}, k={config['hypergraph']['k_neighbors']}, "
-        f"degree_clamp_min={config['hypergraph']['degree_clamp_min']}"
+        f"degree_clamp_min={config['hypergraph']['degree_clamp_min']}, "
+        f"float32_norm={config['hypergraph']['float32_norm']}"
     )
     logger.info(f"输出目录: {output_dir}")
 
@@ -225,11 +231,12 @@ def predict(output_dir: str, config_path: str = None):
     )
 
     test_loader = data["test_loader"]
-    scaler_list = data["scaler"]
+    weather_scaler = data["weather_scaler"]
     positions = data["positions"]
     position_dim = data["position_dim"]
     input_feature_dim = data.get("input_feature_dim", data.get("feature_dim"))
     target_dim = data.get("target_dim", data.get("feature_dim"))
+    target_weather_dim = data["target_weather_dim"]
 
     checkpoint_path = os.path.join(output_dir, "checkpoints", "best_model.pth")
     if not os.path.exists(checkpoint_path):
@@ -252,7 +259,9 @@ def predict(output_dir: str, config_path: str = None):
     if use_amp:
         logger.info("[AMP] 混合精度推理已启用")
     logger.info("[预测] 开始测试集预测...")
-    predictions, ground_truth = predict_on_test(model, test_loader, device, scaler_list, use_amp=use_amp)
+    predictions, ground_truth = predict_on_test(
+        model, test_loader, device, weather_scaler, target_weather_dim, use_amp=use_amp
+    )
     logger.info(f"[预测] 预测完成: pred={predictions.shape}, truth={ground_truth.shape}")
 
     metrics = compute_metrics(predictions, ground_truth)

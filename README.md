@@ -767,3 +767,28 @@ ground_truth = data["ground_truth"] # shape: (num_samples, 12, num_stations, C)
 AdaGeoHyper-TKAN: Adaptive Geo-Hypergraph Temporal Kolmogorov-Arnold Network
 for Multi-site Meteorological Spatio-temporal Sequence Prediction
 ```
+
+## 新增预处理逻辑（要素自适应）
+
+- 要素配置统一在 `elements_settings.py`：
+  - `kelvin_to_celsius`
+  - `normalize`
+  - `scaler_type`
+  - `context_scaler_type`
+  - `k`
+  - `degree_clamp_min`
+  - `float32_norm`
+
+- 数据预处理（`utils/data_loader.py`）：
+  - Temperature：先做 K->C（`-273.15`），再归一化。
+  - 气象通道使用全局通道标准化器（训练集拟合，val/test复用）。
+  - Context 使用独立 scaler（训练集拟合，val/test复用）。
+  - 启用 context 时，标准化后的 context 会拼接到 `x` 和 `y`。
+
+- K 值与稳定参数：
+  - 训练/预测会按要素自动覆盖 `hypergraph.k_neighbors`、`degree_clamp_min`、`float32_norm`。
+  - 训练开始会打印：Element、Effective K、Config K。
+
+- 指标反标准化：
+  - 仅对气象目标通道反标准化并计算 MAE/RMSE/MAPE。
+  - 若 `y` 中拼接了 context 通道，不参与指标计算。

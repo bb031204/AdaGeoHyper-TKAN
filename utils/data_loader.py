@@ -1,4 +1,4 @@
-import os
+﻿import os
 import pickle
 import logging
 from typing import Optional, Tuple, List, Dict
@@ -25,25 +25,94 @@ CONTEXT_FEATURE_ORDER = [
 
 
 class StandardScaler:
-    def __init__(self, mean: float = 0.0, std: float = 1.0):
-        self.mean = mean
-        self.std = std
+    """Channel-wise standard scaler: mean=0, std=1."""
 
-    def fit(self, data: np.ndarray):
-        self.mean = float(np.mean(data))
-        self.std = float(np.std(data))
+    def __init__(self, mean: Optional[np.ndarray] = None, std: Optional[np.ndarray] = None):
+        self.mean = None if mean is None else np.asarray(mean, dtype=np.float64)
+        self.std = None if std is None else np.asarray(std, dtype=np.float64)
+
+    def fit(self, data_2d: np.ndarray):
+        # data_2d: [N, C]
+        self.mean = np.mean(data_2d, axis=0, dtype=np.float64)
+        self.std = np.std(data_2d, axis=0, dtype=np.float64)
+        self.std = np.maximum(self.std, 1e-8)
         return self
 
-    def transform(self, data: np.ndarray) -> np.ndarray:
-        return (data - self.mean) / (self.std + 1e-8)
+    def _reshape_stats_np(self, data: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        shape = (1,) * (data.ndim - 1) + (-1,)
+        return self.mean.reshape(shape), self.std.reshape(shape)
+
+    def _reshape_stats_torch(self, data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        shape = (1,) * (data.ndim - 1) + (-1,)
+        mean = torch.as_tensor(self.mean, dtype=data.dtype, device=data.device).reshape(shape)
+        std = torch.as_tensor(self.std, dtype=data.dtype, device=data.device).reshape(shape)
+        return mean, std
+
+    def transform(self, data):
+        if isinstance(data, torch.Tensor):
+            mean, std = self._reshape_stats_torch(data)
+            return (data - mean) / (std + 1e-8)
+        mean, std = self._reshape_stats_np(data)
+        return (data - mean) / (std + 1e-8)
 
     def inverse_transform(self, data):
         if isinstance(data, torch.Tensor):
-            return data * self.std + self.mean
-        return data * self.std + self.mean
+            mean, std = self._reshape_stats_torch(data)
+            return data * std + mean
+        mean, std = self._reshape_stats_np(data)
+        return data * std + mean
 
     def __repr__(self):
-        return f"StandardScaler(mean={self.mean:.4f}, std={self.std:.4f})"
+        return f"StandardScaler(channels={0 if self.mean is None else self.mean.shape[0]})"
+
+
+class MinMaxScaler:
+    """Channel-wise min-max scaler to [0, 1]."""
+
+    def __init__(self, data_min: Optional[np.ndarray] = None, data_max: Optional[np.ndarray] = None):
+        self.data_min = None if data_min is None else np.asarray(data_min, dtype=np.float64)
+        self.data_max = None if data_max is None else np.asarray(data_max, dtype=np.float64)
+
+    def fit(self, data_2d: np.ndarray):
+        self.data_min = np.min(data_2d, axis=0)
+        self.data_max = np.max(data_2d, axis=0)
+        return self
+
+    def _reshape_stats_np(self, data: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        shape = (1,) * (data.ndim - 1) + (-1,)
+        return self.data_min.reshape(shape), self.data_max.reshape(shape)
+
+    def _reshape_stats_torch(self, data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        shape = (1,) * (data.ndim - 1) + (-1,)
+        data_min = torch.as_tensor(self.data_min, dtype=data.dtype, device=data.device).reshape(shape)
+        data_max = torch.as_tensor(self.data_max, dtype=data.dtype, device=data.device).reshape(shape)
+        return data_min, data_max
+
+    def transform(self, data):
+        if isinstance(data, torch.Tensor):
+            data_min, data_max = self._reshape_stats_torch(data)
+            return (data - data_min) / (data_max - data_min + 1e-8)
+        data_min, data_max = self._reshape_stats_np(data)
+        return (data - data_min) / (data_max - data_min + 1e-8)
+
+    def inverse_transform(self, data):
+        if isinstance(data, torch.Tensor):
+            data_min, data_max = self._reshape_stats_torch(data)
+            return data * (data_max - data_min + 1e-8) + data_min
+        data_min, data_max = self._reshape_stats_np(data)
+        return data * (data_max - data_min + 1e-8) + data_min
+
+    def __repr__(self):
+        return f"MinMaxScaler(channels={0 if self.data_min is None else self.data_min.shape[0]})"
+
+
+def build_scaler(scaler_type: str, data_2d: np.ndarray):
+    st = str(scaler_type).strip().lower()
+    if st == "standard":
+        return StandardScaler().fit(data_2d)
+    if st == "minmax":
+        return MinMaxScaler().fit(data_2d)
+    raise ValueError(f"Unsupported scaler_type='{scaler_type}', supported: standard/minmax")
 
 
 def resolve_context_indices(context_features: Optional[Dict[str, bool]]) -> Tuple[List[int], List[str]]:
@@ -72,12 +141,32 @@ def resolve_context_indices(context_features: Optional[Dict[str, bool]]) -> Tupl
     return selected, selected_names
 
 
+def _preprocess_context_calendar(context_sel: np.ndarray, context_indices: List[int]) -> np.ndarray:
+    """Apply simple modular mapping for periodic context features before scaling."""
+    out = context_sel.copy()
+    # month in [1,12] -> [-0.5, 0.5)
+    if 1 in context_indices:
+        local_idx = context_indices.index(1)
+        out[..., local_idx] = ((out[..., local_idx] - 1.0) % 12.0) / 12.0 - 0.5
+    # day in [1,31] -> [-0.5, 0.5)
+    if 2 in context_indices:
+        local_idx = context_indices.index(2)
+        out[..., local_idx] = ((out[..., local_idx] - 1.0) % 31.0) / 31.0 - 0.5
+    # time idx in [0, T) -> [-0.5, 0.5)
+    if 3 in context_indices:
+        local_idx = context_indices.index(3)
+        max_t = np.maximum(np.max(out[..., local_idx]), 1.0)
+        out[..., local_idx] = (out[..., local_idx] % max_t) / max_t - 0.5
+    return out
+
+
 class WeatherDataset(Dataset):
     def __init__(
         self,
         data_dir: str,
         mode: str = "trn",
-        scaler: Optional[List[StandardScaler]] = None,
+        weather_scaler: Optional[object] = None,
+        context_scaler: Optional[object] = None,
         sample_ratio: float = 1.0,
         num_stations: Optional[int] = None,
         station_indices: Optional[np.ndarray] = None,
@@ -91,6 +180,8 @@ class WeatherDataset(Dataset):
         self.include_context = include_context
         self.context_indices = context_indices or []
         self.element_settings = element_settings or {}
+        self.weather_scaler = weather_scaler
+        self.context_scaler = context_scaler
 
         pkl_path = os.path.join(data_dir, f"{mode}.pkl")
         logger.info(f"[Data] Loading {mode}: {pkl_path}")
@@ -100,6 +191,8 @@ class WeatherDataset(Dataset):
 
         x = data["x"]
         y = data["y"]
+        weather_dim = y.shape[-1]
+
         context = None
         if self.include_context and len(self.context_indices) > 0:
             if "context" not in data:
@@ -139,30 +232,39 @@ class WeatherDataset(Dataset):
                 context = context[idx]
             logger.info(f"[Data] Sample sampling: {total_samples} -> {n_samples} (ratio={sample_ratio})")
 
+        # temperature unit conversion before normalization
         if self.element_settings.get("kelvin_to_celsius", False):
-            x = x - 273.15
-            y = y - 273.15
+            x[..., :weather_dim] = x[..., :weather_dim] - 273.15
+            y[..., :weather_dim] = y[..., :weather_dim] - 273.15
 
-        # standardize meteorological channels only
-        self.scaler = scaler
-        if scaler is not None and self.element_settings.get("normalize", True):
-            target_dim = y.shape[-1]
-            for i in range(target_dim):
-                x[..., i] = scaler[i].transform(x[..., i])
-                y[..., i] = scaler[i].transform(y[..., i])
+        # weather normalization (global scaler, channel-wise stats)
+        if self.weather_scaler is not None and self.element_settings.get("normalize", True):
+            x[..., :weather_dim] = self.weather_scaler.transform(x[..., :weather_dim])
+            y[..., :weather_dim] = self.weather_scaler.transform(y[..., :weather_dim])
 
-        # concat selected context channels to x only
+        # context normalization + concat to x/y
         if context is not None and len(self.context_indices) > 0:
             context_dim = context.shape[-1]
             if max(self.context_indices) >= context_dim:
                 raise IndexError(
                     f"context dimension={context_dim}, requested indices={self.context_indices}"
                 )
-            x = np.concatenate([x, context[..., self.context_indices]], axis=-1)
-            logger.info(f"[Data] Context concat enabled, x channels -> {x.shape[-1]}, indices={self.context_indices}")
+
+            context_sel = context[..., self.context_indices]
+            context_sel = _preprocess_context_calendar(context_sel, self.context_indices)
+            if self.context_scaler is not None:
+                context_sel = self.context_scaler.transform(context_sel)
+
+            x = np.concatenate([x, context_sel], axis=-1)
+            y = np.concatenate([y, context_sel], axis=-1)
+            logger.info(
+                f"[Data] Context concat enabled, x/y channels -> {x.shape[-1]}/{y.shape[-1]}, "
+                f"indices={self.context_indices}"
+            )
 
         self.x = x.astype(np.float32)
         self.y = y.astype(np.float32)
+        self.weather_dim = weather_dim
         logger.info(f"[Data] Final {mode}: x={self.x.shape}, y={self.y.shape}")
 
     def __len__(self) -> int:
@@ -209,9 +311,6 @@ def load_positions(
         alt = context_altitude
         alt_source = "context channel 5"
 
-    # Keep lon/lat and altitude aligned before concatenation.
-    # This handles the case where context_altitude is already sampled
-    # by station_indices but lonlat is still full-station.
     if station_indices is not None:
         lonlat = lonlat[station_indices]
         if alt is not None:
@@ -278,26 +377,11 @@ def create_data_loaders(
         trn_raw = pickle.load(f)
 
     train_x = trn_raw["x"]  # (N, T, Stations, C_target)
-    target_dim = train_x.shape[-1]
+    target_weather_dim = train_x.shape[-1]
     total_stations = train_x.shape[2]
 
     context_indices, context_feature_names = resolve_context_indices(context_features)
-    if include_context and len(context_indices) > 0:
-        if "context" not in trn_raw:
-            raise KeyError("include_context=true but trn.pkl has no 'context'")
-        context_dim = trn_raw["context"].shape[-1]
-        if max(context_indices) >= context_dim:
-            raise IndexError(f"context dim={context_dim}, requested indices={context_indices}")
-        input_feature_dim = target_dim + len(context_indices)
-        logger.info(
-            f"[Data] Context enabled: {context_feature_names} (indices={context_indices}), "
-            f"input channels {target_dim} -> {input_feature_dim}"
-        )
-    else:
-        input_feature_dim = target_dim
-        logger.info("[Data] Context disabled")
 
-    # station sampling indices fixed for all splits
     station_indices = None
     actual_stations = total_stations
     if num_stations is not None and num_stations < total_stations:
@@ -305,15 +389,41 @@ def create_data_loaders(
         actual_stations = num_stations
         logger.info(f"[Data] Station sampling: {total_stations} -> {num_stations}")
 
-    # scaler from target channels only (after element-specific unit conversion)
-    train_data_for_scaler = train_x[:, :, station_indices, :] if station_indices is not None else train_x
+    # fit weather scaler from training split only
+    weather_for_fit = train_x[:, :, station_indices, :] if station_indices is not None else train_x
     if element_settings.get("kelvin_to_celsius", False):
-        train_data_for_scaler = train_data_for_scaler - 273.15
-    scaler = []
-    for i in range(target_dim):
-        ch_data = train_data_for_scaler[..., i]
-        sc = StandardScaler(mean=float(ch_data.mean()), std=float(ch_data.std()))
-        scaler.append(sc)
+        weather_for_fit = weather_for_fit - 273.15
+
+    weather_scaler = None
+    if element_settings.get("normalize", True):
+        weather_fit_2d = weather_for_fit.reshape(-1, target_weather_dim)
+        weather_scaler = build_scaler(element_settings.get("scaler_type", "standard"), weather_fit_2d)
+
+    # context scaler fit from training split only
+    context_scaler = None
+    selected_context_dim = 0
+    if include_context and len(context_indices) > 0:
+        if "context" not in trn_raw:
+            raise KeyError("include_context=true but trn.pkl has no 'context'")
+        context_dim = trn_raw["context"].shape[-1]
+        if max(context_indices) >= context_dim:
+            raise IndexError(f"context dim={context_dim}, requested indices={context_indices}")
+
+        context_fit = trn_raw["context"][:, :, station_indices, :] if station_indices is not None else trn_raw["context"]
+        context_sel_fit = context_fit[..., context_indices]
+        context_sel_fit = _preprocess_context_calendar(context_sel_fit, context_indices)
+        selected_context_dim = context_sel_fit.shape[-1]
+        context_fit_2d = context_sel_fit.reshape(-1, selected_context_dim)
+        context_scaler = build_scaler(
+            element_settings.get("context_scaler_type", "standard"),
+            context_fit_2d,
+        )
+        logger.info(
+            f"[Data] Context enabled: {context_feature_names} (indices={context_indices}), "
+            f"input channels {target_weather_dim} -> {target_weather_dim + selected_context_dim}"
+        )
+    else:
+        logger.info("[Data] Context disabled")
 
     # optional altitude from context channel 5 for hypergraph
     context_altitude = None
@@ -328,12 +438,13 @@ def create_data_loaders(
         else:
             logger.warning("[Data] use_context_altitude=true but context channel 5 not available")
 
-    del trn_raw, train_x, train_data_for_scaler
+    del trn_raw, train_x, weather_for_fit
 
     train_set = WeatherDataset(
         data_dir,
         mode="trn",
-        scaler=scaler,
+        weather_scaler=weather_scaler,
+        context_scaler=context_scaler,
         sample_ratio=sample_ratio,
         station_indices=station_indices,
         include_context=include_context,
@@ -343,7 +454,8 @@ def create_data_loaders(
     val_set = WeatherDataset(
         data_dir,
         mode="val",
-        scaler=scaler,
+        weather_scaler=weather_scaler,
+        context_scaler=context_scaler,
         sample_ratio=val_sample_ratio,
         station_indices=station_indices,
         include_context=include_context,
@@ -353,7 +465,8 @@ def create_data_loaders(
     test_set = WeatherDataset(
         data_dir,
         mode="test",
-        scaler=scaler,
+        weather_scaler=weather_scaler,
+        context_scaler=context_scaler,
         sample_ratio=test_sample_ratio,
         station_indices=station_indices,
         include_context=include_context,
@@ -371,21 +484,28 @@ def create_data_loaders(
         context_altitude=context_altitude,
     )
 
+    total_target_dim = target_weather_dim + selected_context_dim
+    input_feature_dim = target_weather_dim + selected_context_dim
+
     result = {
         "train_loader": train_loader,
         "val_loader": val_loader,
         "test_loader": test_loader,
-        "scaler": scaler,
+        "scaler": weather_scaler,
+        "weather_scaler": weather_scaler,
+        "context_scaler": context_scaler,
         "positions": positions,
         "position_dim": position_dim,
         "input_feature_dim": input_feature_dim,
-        "target_dim": target_dim,
-        "feature_dim": target_dim,
+        "target_dim": total_target_dim,
+        "target_weather_dim": target_weather_dim,
+        "feature_dim": total_target_dim,
         "station_indices": station_indices,
         "num_stations": actual_stations,
         "include_context": include_context,
         "context_indices": context_indices,
         "context_feature_names": context_feature_names,
+        "context_dim_selected": selected_context_dim,
         "element": element_name,
         "element_settings": element_settings,
     }
@@ -393,12 +513,17 @@ def create_data_loaders(
     logger.info("[Data] Data loading done")
     logger.info(
         f"  Element: {element_name}, normalize={element_settings.get('normalize', True)}, "
-        f"kelvin_to_celsius={element_settings.get('kelvin_to_celsius', False)}"
+        f"kelvin_to_celsius={element_settings.get('kelvin_to_celsius', False)}, "
+        f"weather_scaler={element_settings.get('scaler_type', 'standard')}, "
+        f"context_scaler={element_settings.get('context_scaler_type', 'standard')}"
     )
     logger.info(f"  Train samples: {len(train_set)}")
     logger.info(f"  Val samples: {len(val_set)}")
     logger.info(f"  Test samples: {len(test_set)}")
-    logger.info(f"  Stations: {actual_stations}, input_dim={input_feature_dim}, target_dim={target_dim}")
+    logger.info(
+        f"  Stations: {actual_stations}, input_dim={input_feature_dim}, "
+        f"target_dim={total_target_dim}, weather_target_dim={target_weather_dim}"
+    )
     logger.info(f"  Position dim: {position_dim}")
 
     return result

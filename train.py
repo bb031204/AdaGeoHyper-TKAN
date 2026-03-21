@@ -186,6 +186,7 @@ def build_model(config: dict, input_feature_dim: int, target_dim: int, position_
         summary_pool=hyper_cfg["summary_pool"],
         scorer_hidden_dim=hyper_cfg["scorer_hidden_dim"],
         degree_clamp_min=hyper_cfg.get("degree_clamp_min", 1e-6),
+        float32_norm=hyper_cfg.get("float32_norm", False),
         hypergraph_layers=model_cfg["hypergraph_layers"],
         fusion_dim=model_cfg["fusion_dim"],
         dropout=model_cfg["dropout"],
@@ -210,7 +211,6 @@ def train_one_epoch(
     criterion: nn.Module,
     optimizer,
     device: torch.device,
-    scaler_list,
     epoch: int,
     config: dict,
     use_amp: bool = False,
@@ -293,7 +293,8 @@ def evaluate(
     data_loader,
     criterion: nn.Module,
     device: torch.device,
-    scaler_list,
+    weather_scaler,
+    target_weather_dim: int,
     use_amp: bool = False,
 ) -> Dict[str, float]:
     """
@@ -337,12 +338,14 @@ def evaluate(
         pred_np = pred.float().cpu().numpy()
         true_np = y.float().cpu().numpy()
 
-        for ch in range(pred_np.shape[-1]):
-            pred_np[..., ch] = scaler_list[ch].inverse_transform(pred_np[..., ch])
-            true_np[..., ch] = scaler_list[ch].inverse_transform(true_np[..., ch])
+        pred_weather = pred_np[..., :target_weather_dim]
+        true_weather = true_np[..., :target_weather_dim]
+        if weather_scaler is not None:
+            pred_weather = weather_scaler.inverse_transform(pred_weather)
+            true_weather = weather_scaler.inverse_transform(true_weather)
 
-        all_preds.append(pred_np)
-        all_trues.append(true_np)
+        all_preds.append(pred_weather)
+        all_trues.append(true_weather)
 
     pbar.close()
 
@@ -481,6 +484,7 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
     element_k = int(element_settings["k"])
     config["hypergraph"]["k_neighbors"] = element_k
     config["hypergraph"]["degree_clamp_min"] = float(element_settings.get("degree_clamp_min", 1e-6))
+    config["hypergraph"]["float32_norm"] = bool(element_settings.get("float32_norm", False))
     dataset_name = config["data"]["dataset_name"]
 
     # ---- 2. 创建/复用输出目录 ----
@@ -505,7 +509,8 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         )
     logger.info(
         f"要素: {element_name}, 生效k={config['hypergraph']['k_neighbors']}, "
-        f"config_k={config_k_raw}, degree_clamp_min={config['hypergraph']['degree_clamp_min']}"
+        f"config_k={config_k_raw}, degree_clamp_min={config['hypergraph']['degree_clamp_min']}, "
+        f"float32_norm={config['hypergraph']['float32_norm']}"
     )
     logger.info(f"输出目录: {output_dir}")
 
@@ -538,11 +543,12 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
 
     train_loader = data["train_loader"]
     val_loader = data["val_loader"]
-    scaler_list = data["scaler"]
+    weather_scaler = data["weather_scaler"]
     positions = data["positions"]
     position_dim = data["position_dim"]
     input_feature_dim = data.get("input_feature_dim", data.get("feature_dim"))
     target_dim = data.get("target_dim", data.get("feature_dim"))
+    target_weather_dim = data["target_weather_dim"]
 
     # ---- 8. 构建模型 ----
     model = build_model(config, input_feature_dim, target_dim, position_dim, device)
@@ -810,14 +816,14 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         # 训练
         train_metrics = train_one_epoch(
             model, train_loader, criterion, optimizer, device,
-            scaler_list, epoch, config,
+            epoch, config,
             use_amp=use_amp, grad_scaler=grad_scaler,
         )
         train_losses.append(train_metrics["loss"])
 
         # 验证
         val_metrics = evaluate(
-            model, val_loader, criterion, device, scaler_list,
+            model, val_loader, criterion, device, weather_scaler, target_weather_dim,
             use_amp=use_amp,
         )
         val_losses.append(val_metrics["loss"])

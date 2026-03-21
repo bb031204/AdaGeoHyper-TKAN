@@ -5,26 +5,38 @@ ELEMENT_SETTINGS: Dict[str, Dict] = {
     "Temperature": {
         "kelvin_to_celsius": True,
         "normalize": True,
+        "scaler_type": "standard",
+        "context_scaler_type": "standard",
         "k": 6,
         "degree_clamp_min": 1e-6,
+        "float32_norm": False,
     },
     "Cloud": {
         "kelvin_to_celsius": False,
         "normalize": True,
+        "scaler_type": "standard",
+        "context_scaler_type": "standard",
         "k": 6,
         "degree_clamp_min": 1e-6,
+        "float32_norm": True,
     },
     "Humidity": {
         "kelvin_to_celsius": False,
         "normalize": True,
+        "scaler_type": "standard",
+        "context_scaler_type": "standard",
         "k": 3,
         "degree_clamp_min": 1e-6,
+        "float32_norm": True,
     },
     "Wind": {
         "kelvin_to_celsius": False,
         "normalize": True,
+        "scaler_type": "standard",
+        "context_scaler_type": "standard",
         "k": 6,
         "degree_clamp_min": 1e-6,
+        "float32_norm": False,
     },
 }
 

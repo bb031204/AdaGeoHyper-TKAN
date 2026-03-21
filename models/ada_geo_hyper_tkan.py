@@ -78,6 +78,7 @@ class AdaGeoHyperTKAN(nn.Module):
         summary_pool: str = "mean",
         scorer_hidden_dim: int = 32,
         degree_clamp_min: float = 1e-6,
+        float32_norm: bool = False,
         hypergraph_layers: int = 2,
         fusion_dim: int = 64,
         dropout: float = 0.1,
@@ -118,6 +119,7 @@ class AdaGeoHyperTKAN(nn.Module):
             summary_pool=summary_pool,
             scorer_hidden_dim=scorer_hidden_dim,
             degree_clamp_min=degree_clamp_min,
+            float32_norm=float32_norm,
             num_layers=hypergraph_layers,
             dropout=dropout,
         )
