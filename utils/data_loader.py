@@ -7,6 +7,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
+from elements_settings import get_element_settings, normalize_element_name
+
 logger = logging.getLogger(__name__)
 
 
@@ -81,12 +83,14 @@ class WeatherDataset(Dataset):
         station_indices: Optional[np.ndarray] = None,
         include_context: bool = False,
         context_indices: Optional[List[int]] = None,
+        element_settings: Optional[Dict] = None,
     ):
         super().__init__()
         self.data_dir = data_dir
         self.mode = mode
         self.include_context = include_context
         self.context_indices = context_indices or []
+        self.element_settings = element_settings or {}
 
         pkl_path = os.path.join(data_dir, f"{mode}.pkl")
         logger.info(f"[Data] Loading {mode}: {pkl_path}")
@@ -135,9 +139,13 @@ class WeatherDataset(Dataset):
                 context = context[idx]
             logger.info(f"[Data] Sample sampling: {total_samples} -> {n_samples} (ratio={sample_ratio})")
 
+        if self.element_settings.get("kelvin_to_celsius", False):
+            x = x - 273.15
+            y = y - 273.15
+
         # standardize meteorological channels only
         self.scaler = scaler
-        if scaler is not None:
+        if scaler is not None and self.element_settings.get("normalize", True):
             target_dim = y.shape[-1]
             for i in range(target_dim):
                 x[..., i] = scaler[i].transform(x[..., i])
@@ -256,8 +264,14 @@ def create_data_loaders(
     include_context: bool = False,
     context_features: Optional[Dict[str, bool]] = None,
     use_context_altitude: bool = True,
+    element: Optional[str] = None,
 ) -> Dict:
     np.random.seed(seed)
+
+    if element is None:
+        element = "Temperature"
+    element_name = normalize_element_name(element)
+    element_settings = get_element_settings(element_name)
 
     trn_path = os.path.join(data_dir, "trn.pkl")
     with open(trn_path, "rb") as f:
@@ -291,8 +305,10 @@ def create_data_loaders(
         actual_stations = num_stations
         logger.info(f"[Data] Station sampling: {total_stations} -> {num_stations}")
 
-    # scaler from target channels only
+    # scaler from target channels only (after element-specific unit conversion)
     train_data_for_scaler = train_x[:, :, station_indices, :] if station_indices is not None else train_x
+    if element_settings.get("kelvin_to_celsius", False):
+        train_data_for_scaler = train_data_for_scaler - 273.15
     scaler = []
     for i in range(target_dim):
         ch_data = train_data_for_scaler[..., i]
@@ -322,6 +338,7 @@ def create_data_loaders(
         station_indices=station_indices,
         include_context=include_context,
         context_indices=context_indices,
+        element_settings=element_settings,
     )
     val_set = WeatherDataset(
         data_dir,
@@ -331,6 +348,7 @@ def create_data_loaders(
         station_indices=station_indices,
         include_context=include_context,
         context_indices=context_indices,
+        element_settings=element_settings,
     )
     test_set = WeatherDataset(
         data_dir,
@@ -340,6 +358,7 @@ def create_data_loaders(
         station_indices=station_indices,
         include_context=include_context,
         context_indices=context_indices,
+        element_settings=element_settings,
     )
 
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True, drop_last=False)
@@ -367,9 +386,15 @@ def create_data_loaders(
         "include_context": include_context,
         "context_indices": context_indices,
         "context_feature_names": context_feature_names,
+        "element": element_name,
+        "element_settings": element_settings,
     }
 
     logger.info("[Data] Data loading done")
+    logger.info(
+        f"  Element: {element_name}, normalize={element_settings.get('normalize', True)}, "
+        f"kelvin_to_celsius={element_settings.get('kelvin_to_celsius', False)}"
+    )
     logger.info(f"  Train samples: {len(train_set)}")
     logger.info(f"  Val samples: {len(val_set)}")
     logger.info(f"  Test samples: {len(test_set)}")

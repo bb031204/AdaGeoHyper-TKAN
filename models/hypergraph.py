@@ -252,6 +252,7 @@ class AdaptiveGeoHypergraph(nn.Module):
         lambda_alt: float = 0.5,
         summary_pool: str = "mean",
         scorer_hidden_dim: int = 32,
+        degree_clamp_min: float = 1e-6,
         num_layers: int = 2,
         dropout: float = 0.1,
     ):
@@ -262,6 +263,7 @@ class AdaptiveGeoHypergraph(nn.Module):
         self.k_neighbors = k_neighbors
         self.lambda_geo = lambda_geo
         self.lambda_alt = lambda_alt
+        self.degree_clamp_min = degree_clamp_min
         self.summary_pool = summary_pool
         self.num_layers = num_layers
 
@@ -493,14 +495,20 @@ class AdaptiveGeoHypergraph(nn.Module):
         # p_neighbor: [B, N, K+1, P]
 
         # 计算打分
-        scores = self.scorer(p_center, p_neighbor, s_center, s_neighbor)
+        scores = self.scorer(
+            p_center.float(),
+            p_neighbor.float(),
+            s_center.float(),
+            s_neighbor.float(),
+        )
         # scores: [B, N, K+1]
 
         # softmax 归一化
-        weights = F.softmax(scores, dim=-1)
+        weights = F.softmax(scores.float(), dim=-1)
+        weights = weights.clamp_min(self.degree_clamp_min)
+        weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(self.degree_clamp_min)
         # weights: [B, N, K+1]
-
-        return weights
+        return weights.to(x.dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

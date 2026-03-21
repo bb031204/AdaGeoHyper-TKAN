@@ -56,6 +56,7 @@ from utils.data_loader import create_data_loaders, StandardScaler
 from utils.metrics import compute_metrics, compute_per_step_metrics
 from utils.logger import setup_logger
 from utils.visualization import plot_loss_curve, plot_metrics_curve
+from elements_settings import resolve_element_from_config, get_element_settings
 
 logger = logging.getLogger("AdaGeoHyperTKAN")
 
@@ -184,6 +185,7 @@ def build_model(config: dict, input_feature_dim: int, target_dim: int, position_
         lambda_alt=hyper_cfg["lambda_alt"],
         summary_pool=hyper_cfg["summary_pool"],
         scorer_hidden_dim=hyper_cfg["scorer_hidden_dim"],
+        degree_clamp_min=hyper_cfg.get("degree_clamp_min", 1e-6),
         hypergraph_layers=model_cfg["hypergraph_layers"],
         fusion_dim=model_cfg["fusion_dim"],
         dropout=model_cfg["dropout"],
@@ -472,6 +474,13 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
     """
     # ---- 1. 加载配置 ----
     config = load_config(config_path)
+    element_name = resolve_element_from_config(config)
+    element_settings = get_element_settings(element_name)
+    config["data"]["element"] = element_name
+    config_k_raw = config.get("hypergraph", {}).get("k_neighbors", None)
+    element_k = int(element_settings["k"])
+    config["hypergraph"]["k_neighbors"] = element_k
+    config["hypergraph"]["degree_clamp_min"] = float(element_settings.get("degree_clamp_min", 1e-6))
     dataset_name = config["data"]["dataset_name"]
 
     # ---- 2. 创建/复用输出目录 ----
@@ -489,6 +498,15 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
     logger.info("AdaGeoHyper-TKAN 训练启动")
     logger.info("=" * 60)
     logger.info(f"数据集: {dataset_name}")
+    if config_k_raw is not None and int(config_k_raw) != element_k:
+        logger.warning(
+            f"[K覆盖] config.hypergraph.k_neighbors={config_k_raw} 与 element={element_name} 预设不一致, "
+            f"已覆盖为 {element_k}"
+        )
+    logger.info(
+        f"要素: {element_name}, 生效k={config['hypergraph']['k_neighbors']}, "
+        f"config_k={config_k_raw}, degree_clamp_min={config['hypergraph']['degree_clamp_min']}"
+    )
     logger.info(f"输出目录: {output_dir}")
 
     # ---- 4. 设置种子 ----
@@ -515,6 +533,7 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         include_context=config["data"].get("include_context", False),
         context_features=config["data"].get("context_features", {}),
         use_context_altitude=config["hypergraph"].get("use_context_altitude", True),
+        element=element_name,
     )
 
     train_loader = data["train_loader"]
@@ -639,6 +658,11 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
     tqdm_log(f"\n  {C.CYAN}{'━'*W}{C.RESET}")
     tqdm_log(f"  {C.CYAN}{C.BOLD}{'TRAINING':^{W}}{C.RESET}")
     tqdm_log(f"  {C.CYAN}{'━'*W}{C.RESET}")
+    tqdm_log(
+        f"    Element: {C.WHITE}{element_name}{C.RESET}  │  "
+        f"Effective K: {C.WHITE}{config['hypergraph']['k_neighbors']}{C.RESET}  │  "
+        f"Config K: {C.DIM}{config_k_raw}{C.RESET}"
+    )
     tqdm_log(f"    Epochs: {C.WHITE}{epochs}{C.RESET}  │  Batch: {C.WHITE}{config['training']['batch_size']}{C.RESET}"
              f"  │  Early Stop: {C.WHITE}{'On' if use_early_stop else 'Off'}{C.RESET}"
              f" (patience={patience})"

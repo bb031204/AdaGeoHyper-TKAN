@@ -29,7 +29,7 @@ data:
 
 # ---- 超图配置 ----
 hypergraph:
-  k_neighbors: 6                        # K近邻数量
+  k_neighbors: 6                        # 仅作为回退/展示；训练时会按 data.element 从 elements_settings.py 自动覆盖
   lambda_geo: 1.0                       # 地理平面距离权重
   lambda_alt: 0.5                       # 海拔差权重
   use_context_altitude: true            # position.pkl 无海拔时，是否用 context 第5通道作为海拔

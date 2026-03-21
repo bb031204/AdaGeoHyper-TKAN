@@ -28,6 +28,7 @@ from utils.data_loader import create_data_loaders
 from utils.logger import setup_logger
 from utils.metrics import compute_metrics, compute_per_step_metrics
 from utils.visualization import plot_per_step_metrics, plot_prediction_vs_truth
+from elements_settings import resolve_element_from_config, get_element_settings
 
 logger = logging.getLogger("AdaGeoHyperTKAN")
 
@@ -72,6 +73,7 @@ def load_best_model(
         lambda_alt=hyper_cfg["lambda_alt"],
         summary_pool=hyper_cfg["summary_pool"],
         scorer_hidden_dim=hyper_cfg["scorer_hidden_dim"],
+        degree_clamp_min=hyper_cfg.get("degree_clamp_min", 1e-6),
         hypergraph_layers=model_cfg["hypergraph_layers"],
         fusion_dim=model_cfg["fusion_dim"],
         dropout=model_cfg["dropout"],
@@ -181,6 +183,11 @@ def predict(output_dir: str, config_path: str = None):
     if config_path is None:
         config_path = os.path.join(output_dir, "config_snapshot.yaml")
     config = load_config(config_path)
+    element_name = resolve_element_from_config(config)
+    element_settings = get_element_settings(element_name)
+    config["data"]["element"] = element_name
+    config["hypergraph"]["k_neighbors"] = int(element_settings["k"])
+    config["hypergraph"]["degree_clamp_min"] = float(element_settings.get("degree_clamp_min", 1e-6))
     dataset_name = config["data"]["dataset_name"]
 
     setup_logger("AdaGeoHyperTKAN", log_dir=output_dir)
@@ -188,6 +195,10 @@ def predict(output_dir: str, config_path: str = None):
     logger.info("AdaGeoHyper-TKAN 测试预测")
     logger.info("=" * 60)
     logger.info(f"数据集: {dataset_name}")
+    logger.info(
+        f"要素: {element_name}, k={config['hypergraph']['k_neighbors']}, "
+        f"degree_clamp_min={config['hypergraph']['degree_clamp_min']}"
+    )
     logger.info(f"输出目录: {output_dir}")
 
     device_str = config["training"]["device"]
@@ -210,6 +221,7 @@ def predict(output_dir: str, config_path: str = None):
         include_context=config["data"].get("include_context", False),
         context_features=config["data"].get("context_features", {}),
         use_context_altitude=config["hypergraph"].get("use_context_altitude", True),
+        element=element_name,
     )
 
     test_loader = data["test_loader"]
@@ -296,4 +308,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     predict(args.output_dir, args.config)
-

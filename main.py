@@ -1,29 +1,12 @@
-"""
-Main: 统一启动入口
-=================
-
-串联训练与预测流程，作为项目统一入口。
-
-用法示例:
-    # 完整流程（训练 + 预测）
-    python main.py --config config.yaml
-
-    # 仅训练
-    python main.py --config config.yaml --mode train
-
-    # 仅预测（需要指定训练输出目录）
-    python main.py --mode predict --output_dir outputs/20240101_120000_temperature
-
-    # 覆盖数据集
-    python main.py --config config.yaml --dataset temperature
-
-    # 指定设备
-    python main.py --config config.yaml --device cuda
+﻿"""
+Main entry for AdaGeoHyper-TKAN.
 """
 
 import argparse
 import os
 import sys
+
+from elements_settings import get_dataset_name_from_element, normalize_element_name
 
 project_root = os.path.dirname(os.path.abspath(__file__))
 if project_root not in sys.path:
@@ -31,92 +14,46 @@ if project_root not in sys.path:
 
 
 def parse_args():
-    """解析命令行参数。"""
     parser = argparse.ArgumentParser(
-        description="AdaGeoHyper-TKAN: 多站点气象时空序列预测",
+        description="AdaGeoHyper-TKAN runner",
         formatter_class=argparse.RawTextHelpFormatter,
     )
 
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="config.yaml",
-        help="配置文件路径（默认: config.yaml）",
-    )
+    parser.add_argument("--config", type=str, default="config.yaml", help="Config file path")
     parser.add_argument(
         "--mode",
         type=str,
         default="all",
         choices=["all", "train", "predict"],
-        help=(
-            "运行模式:\n"
-            "  all     - 训练 + 预测（默认）\n"
-            "  train   - 仅训练\n"
-            "  predict - 仅预测（需要 --output_dir）"
-        ),
+        help="Run mode: all/train/predict",
     )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default=None,
-        help="预测模式下的训练输出目录",
-    )
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        default=None,
-        help="覆盖配置中的数据集名称（temperature/cloud_cover/humidity/component_of_wind）",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=None,
-        help="覆盖配置中的设备（cuda/cpu/auto）",
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=None,
-        help="覆盖配置中的 batch size",
-    )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=None,
-        help="覆盖配置中的训练轮数",
-    )
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=None,
-        help="覆盖配置中的学习率",
-    )
-    parser.add_argument(
-        "--num_stations",
-        type=int,
-        default=None,
-        help="覆盖配置中的站点数量",
-    )
-    parser.add_argument(
-        "--sample_ratio",
-        type=float,
-        default=None,
-        help="覆盖配置中的样本采样比例",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="覆盖配置中的随机种子",
-    )
+    parser.add_argument("--output_dir", type=str, default=None, help="Output dir for predict mode")
+
+    parser.add_argument("--dataset", type=str, default=None, help="Dataset name override")
+    parser.add_argument("--element", type=str, default=None, help="Element override: Temperature/Cloud/Humidity/Wind")
+    parser.add_argument("--dataset_selection", type=str, default=None, help="Alias of --element")
+
+    parser.add_argument("--device", type=str, default=None, help="Device override: cuda/cpu/auto")
+    parser.add_argument("--batch_size", type=int, default=None, help="Batch size override")
+    parser.add_argument("--epochs", type=int, default=None, help="Epochs override")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate override")
+    parser.add_argument("--num_stations", type=int, default=None, help="Num stations override")
+    parser.add_argument("--sample_ratio", type=float, default=None, help="Train sample ratio override")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed override")
 
     return parser.parse_args()
 
 
 def override_config(config: dict, args) -> dict:
-    """根据命令行参数覆盖配置。"""
     if args.dataset:
         config["data"]["dataset_name"] = args.dataset
+
+    selected_element = args.element or args.dataset_selection
+    if selected_element:
+        element_name = normalize_element_name(selected_element)
+        config["data"]["element"] = element_name
+        config["data"]["dataset_name"] = get_dataset_name_from_element(element_name)
+
     if args.device:
         config["training"]["device"] = args.device
     if args.batch_size:
@@ -135,7 +72,6 @@ def override_config(config: dict, args) -> dict:
 
 
 def main():
-    """主入口函数。"""
     args = parse_args()
 
     from predict import predict as run_predict
@@ -148,7 +84,7 @@ def main():
 
     if args.mode == "predict":
         if args.output_dir is None:
-            print("[错误] 预测模式需要指定 --output_dir")
+            print("[错误] 预测模式需要 --output_dir")
             sys.exit(1)
         run_predict(args.output_dir, args.config if args.config != "config.yaml" else None)
         return
@@ -164,9 +100,7 @@ def main():
     import tempfile
     import yaml
 
-    tmp_config = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".yaml", delete=False, dir=project_root
-    )
+    tmp_config = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, dir=project_root)
     yaml.dump(config, tmp_config, default_flow_style=False, allow_unicode=True)
     tmp_config_path = tmp_config.name
     tmp_config.close()
@@ -182,9 +116,9 @@ def main():
             run_predict(output_dir)
 
             print("\n" + "=" * 60)
-            print("  全部完成!")
-            print(f"  最佳验证损失: {best_val_loss:.6f}")
-            print(f"  结果保存在: {output_dir}")
+            print("  全流程完成!")
+            print(f"  最优验证损失: {best_val_loss:.6f}")
+            print(f"  输出目录: {output_dir}")
             print("=" * 60)
     finally:
         os.unlink(tmp_config_path)
