@@ -24,7 +24,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from models.ada_geo_hyper_tkan import AdaGeoHyperTKAN
-from utils.data_loader import create_data_loaders
+from utils.data_loader import create_data_loaders, load_preprocessing_artifact
 from utils.logger import setup_logger
 from utils.metrics import compute_metrics, compute_per_step_metrics
 from utils.visualization import plot_per_step_metrics, plot_prediction_vs_truth
@@ -216,6 +216,21 @@ def predict(output_dir: str, config_path: str = None):
 
     np.random.seed(config["training"]["seed"])
     data_dir = os.path.join(config["data"]["data_root"], dataset_name)
+    preproc_artifact_path = os.path.join(output_dir, "preprocessing_artifact.pkl")
+    preproc_artifact = None
+    if os.path.exists(preproc_artifact_path):
+        preproc_artifact = load_preprocessing_artifact(preproc_artifact_path)
+        logger.info("[Data] Reusing preprocessing artifact for cross-run consistency")
+        art_element = preproc_artifact.get("element_name", None)
+        if art_element is not None and art_element != element_name:
+            logger.warning(
+                f"[Data] Artifact element={art_element} differs from current element={element_name}"
+            )
+    else:
+        logger.warning(
+            f"[Data] preprocessing artifact not found, fallback to fresh preprocessing: {preproc_artifact_path}"
+        )
+
     data = create_data_loaders(
         data_dir=data_dir,
         batch_size=config["training"]["batch_size"],
@@ -228,6 +243,10 @@ def predict(output_dir: str, config_path: str = None):
         context_features=config["data"].get("context_features", {}),
         use_context_altitude=config["hypergraph"].get("use_context_altitude", True),
         element=element_name,
+        fixed_station_indices=None if preproc_artifact is None else preproc_artifact["station_indices"],
+        weather_scaler_override=None if preproc_artifact is None else preproc_artifact["weather_scaler"],
+        context_scaler_override=None if preproc_artifact is None else preproc_artifact["context_scaler"],
+        robust_preprocess=config["data"].get("robust_preprocess", {}),
     )
 
     test_loader = data["test_loader"]

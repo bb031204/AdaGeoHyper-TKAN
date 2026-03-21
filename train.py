@@ -52,7 +52,11 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(errors="replace")
 
 from models.ada_geo_hyper_tkan import AdaGeoHyperTKAN
-from utils.data_loader import create_data_loaders, StandardScaler
+from utils.data_loader import (
+    create_data_loaders,
+    StandardScaler,
+    save_preprocessing_artifact,
+)
 from utils.metrics import compute_metrics, compute_per_step_metrics
 from utils.logger import setup_logger
 from utils.visualization import plot_loss_curve, plot_metrics_curve
@@ -539,6 +543,7 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         context_features=config["data"].get("context_features", {}),
         use_context_altitude=config["hypergraph"].get("use_context_altitude", True),
         element=element_name,
+        robust_preprocess=config["data"].get("robust_preprocess", {}),
     )
 
     train_loader = data["train_loader"]
@@ -549,6 +554,17 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
     input_feature_dim = data.get("input_feature_dim", data.get("feature_dim"))
     target_dim = data.get("target_dim", data.get("feature_dim"))
     target_weather_dim = data["target_weather_dim"]
+    preproc_artifact_path = os.path.join(output_dir, "preprocessing_artifact.pkl")
+    save_preprocessing_artifact(
+        preproc_artifact_path,
+        station_indices=data["station_indices"],
+        weather_scaler=data["weather_scaler"],
+        context_scaler=data["context_scaler"],
+        element_name=element_name,
+        context_indices=data["context_indices"],
+        context_feature_names=data["context_feature_names"],
+        target_weather_dim=target_weather_dim,
+    )
 
     # ---- 8. 构建模型 ----
     model = build_model(config, input_feature_dim, target_dim, position_dim, device)
@@ -570,12 +586,29 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         weight_decay=config["training"]["weight_decay"],
     )
 
-    scheduler = None
+    warmup_epochs = config["training"].get("warmup_epochs", 3)
     sched_type = config["training"].get("scheduler", "none")
+    scheduler = None
+
     if sched_type == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=config["training"]["epochs"], eta_min=1e-6
-        )
+        total_epochs = config["training"]["epochs"]
+        if warmup_epochs > 0:
+            warmup_sched = torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=1e-3, end_factor=1.0, total_iters=warmup_epochs
+            )
+            cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=total_epochs - warmup_epochs, eta_min=1e-6
+            )
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup_sched, cosine_sched],
+                milestones=[warmup_epochs],
+            )
+            logger.info(f"[Scheduler] Warmup({warmup_epochs}ep) + CosineAnnealing({total_epochs - warmup_epochs}ep)")
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=total_epochs, eta_min=1e-6
+            )
     elif sched_type == "step":
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer,
@@ -600,7 +633,15 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
                 logger.warning(f"[Compile] torch.compile 不可用, 跳过: {e}")
 
     # ---- 11. 损失函数 ----
-    criterion = nn.MSELoss()
+    loss_type = config["training"].get("loss_type", "huber").strip().lower()
+    if loss_type in ("l1", "mae"):
+        criterion = nn.L1Loss()
+    elif loss_type == "huber":
+        criterion = nn.HuberLoss(delta=config["training"].get("huber_delta", 1.0))
+    else:
+        criterion = nn.MSELoss()
+    logger.info(f"[Loss] {criterion.__class__.__name__}"
+                + (f" (delta={criterion.delta})" if hasattr(criterion, "delta") else ""))
 
     # ---- 11.5 AMP 混合精度 ----
     use_amp = config["training"].get("use_amp", False) and device.type == "cuda"

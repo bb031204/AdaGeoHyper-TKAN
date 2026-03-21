@@ -1,25 +1,18 @@
-"""
-Visualization: 可视化模块
-==========================
-
-提供训练过程和预测结果的可视化功能:
-- 训练 loss 曲线
-- 验证指标曲线
-- 预测值 vs 真实值对比图
-- 每个时间步预测对比图
+﻿"""
+Visualization utilities.
 """
 
 import os
+import logging
+from typing import List, Dict
+
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")  # 非交互式后端
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from typing import List, Dict, Optional
-import logging
 
 logger = logging.getLogger(__name__)
 
-# 设置中文字体 (如果可用)
 plt.rcParams["font.family"] = ["DejaVu Sans", "SimHei", "sans-serif"]
 plt.rcParams["axes.unicode_minus"] = False
 
@@ -30,15 +23,6 @@ def plot_loss_curve(
     save_path: str,
     title: str = "Training & Validation Loss",
 ):
-    """
-    绘制训练与验证 loss 曲线。
-
-    Args:
-        train_losses: 每个 epoch 的训练 loss
-        val_losses:   每个 epoch 的验证 loss
-        save_path:    图片保存路径
-        title:        图标题
-    """
     fig, ax = plt.subplots(1, 1, figsize=(10, 6))
     epochs = range(1, len(train_losses) + 1)
 
@@ -51,7 +35,6 @@ def plot_loss_curve(
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3)
 
-    # 标注最佳验证 loss
     best_epoch = np.argmin(val_losses) + 1
     best_val_loss = min(val_losses)
     ax.axvline(x=best_epoch, color="g", linestyle="--", alpha=0.5, label=f"Best@epoch{best_epoch}")
@@ -75,14 +58,6 @@ def plot_metrics_curve(
     save_path: str,
     title: str = "Validation Metrics",
 ):
-    """
-    绘制验证指标随 epoch 变化曲线。
-
-    Args:
-        metrics_history: {'MAE': [...], 'RMSE': [...], 'MAPE': [...]}
-        save_path:       保存路径
-        title:           标题
-    """
     fig, axes = plt.subplots(1, len(metrics_history), figsize=(5 * len(metrics_history), 5))
     if len(metrics_history) == 1:
         axes = [axes]
@@ -96,14 +71,12 @@ def plot_metrics_curve(
         ax.plot(epochs, values, color=color, linewidth=1.5)
         ax.set_xlabel("Epoch", fontsize=11)
         ax.set_ylabel(metric_name, fontsize=11)
-        ax.set_title(f"{metric_name}", fontsize=12)
+        ax.set_title(metric_name, fontsize=12)
         ax.grid(True, alpha=0.3)
 
-        # 标注最佳值
         best_idx = np.argmin(values)
         ax.scatter(best_idx + 1, values[best_idx], color="red", s=50, zorder=5)
-        ax.annotate(f"{values[best_idx]:.4f}", xy=(best_idx + 1, values[best_idx]),
-                    fontsize=9, color="red")
+        ax.annotate(f"{values[best_idx]:.4f}", xy=(best_idx + 1, values[best_idx]), fontsize=9, color="red")
 
     plt.suptitle(title, fontsize=14)
     plt.tight_layout()
@@ -122,57 +95,72 @@ def plot_prediction_vs_truth(
     dataset_name: str = "",
 ):
     """
-    绘制预测值与真实值对比图。
-
-    对选定的样本和站点, 绘制 12 步预测 vs 真实值重叠图。
-
-    Args:
-        pred:         [N, T, N_s, C] 预测结果
-        true:         [N, T, N_s, C] 真实值
-        save_dir:     保存目录
-        num_samples:  绘制的样本数
-        num_stations: 每个样本绘制的站点数
-        dataset_name: 数据集名称
+    Save one stitched figure (grid) for sampled samples/stations.
     """
     os.makedirs(save_dir, exist_ok=True)
     N, T, N_s, C = pred.shape
 
-    # 选择样本和站点
-    sample_indices = np.linspace(0, N - 1, min(num_samples, N), dtype=int)
-    station_indices = np.linspace(0, N_s - 1, min(num_stations, N_s), dtype=int)
+    # Prefer hard examples: choose high-error samples/stations for clearer comparison.
+    ch = 0  # visualize primary target channel
+    mae_sn = np.mean(np.abs(pred[..., ch] - true[..., ch]), axis=1)  # [N, N_s]
+    sample_scores = np.max(mae_sn, axis=1)  # [N]
+    sample_indices = np.argsort(sample_scores)[-min(num_samples, N):]
+    sample_indices = np.sort(sample_indices)
 
-    for s_idx in sample_indices:
-        fig, axes = plt.subplots(len(station_indices), C, figsize=(6 * C, 4 * len(station_indices)))
-        if len(station_indices) == 1 and C == 1:
-            axes = np.array([[axes]])
-        elif len(station_indices) == 1:
-            axes = axes[np.newaxis, :]
-        elif C == 1:
-            axes = axes[:, np.newaxis]
+    station_scores = np.mean(mae_sn[sample_indices, :], axis=0)  # [N_s]
+    station_indices = np.argsort(station_scores)[-min(num_stations, N_s):]
+    station_indices = np.sort(station_indices)
 
-        for row, st_idx in enumerate(station_indices):
-            for ch in range(C):
-                ax = axes[row, ch]
-                time_steps = range(1, T + 1)
+    n_rows = len(sample_indices)
+    n_cols = len(station_indices)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.8 * n_cols, 3.6 * n_rows))
 
-                ax.plot(time_steps, true[s_idx, :, st_idx, ch], "b-o",
-                        label="Truth", markersize=4, linewidth=1.5)
-                ax.plot(time_steps, pred[s_idx, :, st_idx, ch], "r--s",
-                        label="Pred", markersize=4, linewidth=1.5)
+    if n_rows == 1 and n_cols == 1:
+        axes = np.array([[axes]])
+    elif n_rows == 1:
+        axes = axes[np.newaxis, :]
+    elif n_cols == 1:
+        axes = axes[:, np.newaxis]
 
-                ax.set_xlabel("Step", fontsize=10)
-                ax.set_ylabel("Value", fontsize=10)
-                ax.set_title(f"Sample {s_idx}, Station {st_idx}, Ch {ch}", fontsize=10)
-                ax.legend(fontsize=9)
-                ax.grid(True, alpha=0.3)
+    time_steps = np.arange(1, T + 1)
+    overall_mae = float(np.mean(np.abs(pred[..., ch] - true[..., ch])))
 
-        plt.suptitle(f"{dataset_name} - Prediction vs Truth (Sample {s_idx})", fontsize=13)
-        plt.tight_layout()
-        save_path = os.path.join(save_dir, f"pred_vs_truth_sample{s_idx}.png")
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        plt.close()
+    for r, s_idx in enumerate(sample_indices):
+        for c, st_idx in enumerate(station_indices):
+            ax = axes[r, c]
+            y_true = true[s_idx, :, st_idx, ch]
+            y_pred = pred[s_idx, :, st_idx, ch]
+            mae = float(np.mean(np.abs(y_pred - y_true)))
 
-    logger.info(f"[可视化] 预测对比图已保存: {save_dir}")
+            # Error as area between prediction and ground truth curves.
+            ax.fill_between(
+                time_steps,
+                y_true,
+                y_pred,
+                color="#9E9E9E",
+                alpha=0.28,
+                label="Error Area",
+            )
+            ax.plot(time_steps, y_true, color="#1565C0", marker="o", markersize=2.8, linewidth=1.6, label="Ground Truth")
+            ax.plot(time_steps, y_pred, color="#D84315", linestyle="--", marker="s", markersize=2.4, linewidth=1.4, label="Prediction")
+
+            ax.set_xlabel("Forecast Hour", fontsize=8)
+            ax.set_ylabel("Temperature (°C)", fontsize=8)
+            ax.set_title(f"Sample {s_idx}, Station {st_idx}  |  MAE={mae:.2f}°C", fontsize=9, fontweight="bold")
+            ax.grid(True, alpha=0.25)
+            ax.legend(fontsize=6, loc="upper left", framealpha=0.8)
+
+    fig.suptitle(
+        f"{dataset_name} Temperature Prediction  (Overall MAE={overall_mae:.3f}°C)",
+        fontsize=14,
+        fontweight="bold",
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+
+    save_path = os.path.join(save_dir, "pred_vs_truth_grid.png")
+    plt.savefig(save_path, dpi=170, bbox_inches="tight")
+    plt.close()
+    logger.info(f"[可视化] 预测对比拼图已保存: {save_path}")
 
 
 def plot_per_step_metrics(
@@ -180,13 +168,6 @@ def plot_per_step_metrics(
     save_path: str,
     title: str = "Per-Step Metrics",
 ):
-    """
-    绘制每个预测步的指标柱状图。
-
-    Args:
-        per_step: {'MAE': [step1, ...], 'RMSE': [...], 'MAPE': [...]}
-        save_path: 保存路径
-    """
     num_metrics = len(per_step)
     fig, axes = plt.subplots(1, num_metrics, figsize=(5 * num_metrics, 5))
     if num_metrics == 1:
@@ -207,4 +188,4 @@ def plot_per_step_metrics(
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close()
-    logger.info(f"[可视化] 每步指标图已保存: {save_path}")
+    logger.info(f"[可视化] 分步指标图已保存: {save_path}")

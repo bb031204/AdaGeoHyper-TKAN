@@ -1,4 +1,4 @@
-# ================================================================
+﻿# ================================================================
 # AdaGeoHyper-TKAN 配置文件
 # 用于多站点气象时空序列预测
 # ================================================================
@@ -18,14 +18,14 @@ data:
   test_sample_ratio: 1.0                # 测试集样本采样比例
   include_context: true                # 是否启用 context 特征拼接到模型输入
   context_features:
-    use_year: true                      # 年
+    use_year: false                      # 年
     use_month: true                     # 月
     use_day: true                       # 日
     use_time: true                     # 时间窗内索引
     use_region: true                   # 陆地覆盖比例/陆海掩码类特征 (0~1)
-    use_altitude: true                 # 海拔
-    use_longitude: true                # 经度
-    use_latitude: true                 # 纬度
+    use_altitude: false                 # 海拔
+    use_longitude: false                 # 经度
+    use_latitude: alse                 # 纬度
 
 # ---- 超图配置 ----
 hypergraph:
@@ -66,6 +66,9 @@ training:
   scheduler_step_size: 20               # StepLR 步长
   scheduler_gamma: 0.5                  # StepLR 衰减因子
   grad_clip: 1.0                        # 梯度裁剪阈值
+  loss_type: "huber"                    # 损失函数: mse / l1 / huber
+  huber_delta: 1.0                      # HuberLoss delta (仅 loss_type=huber 时生效)
+  warmup_epochs: 3                      # 学习率 warmup 轮数 (0=不启用)
   use_amp: true                         # 是否启用 AMP 混合精度
   use_compile: true                     # 是否启用 torch.compile 编译加速 (需 PyTorch 2.0+)
 
