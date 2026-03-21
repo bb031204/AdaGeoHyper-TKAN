@@ -1,4 +1,4 @@
-﻿import os
+import os
 import pickle
 import logging
 from typing import Optional, Tuple, List, Dict
@@ -242,7 +242,7 @@ class WeatherDataset(Dataset):
             x[..., :weather_dim] = self.weather_scaler.transform(x[..., :weather_dim])
             y[..., :weather_dim] = self.weather_scaler.transform(y[..., :weather_dim])
 
-        # context normalization + concat to x/y
+        # context normalization + concat to x only (y keeps weather-only for loss)
         if context is not None and len(self.context_indices) > 0:
             context_dim = context.shape[-1]
             if max(self.context_indices) >= context_dim:
@@ -256,10 +256,9 @@ class WeatherDataset(Dataset):
                 context_sel = self.context_scaler.transform(context_sel)
 
             x = np.concatenate([x, context_sel], axis=-1)
-            y = np.concatenate([y, context_sel], axis=-1)
             logger.info(
-                f"[Data] Context concat enabled, x/y channels -> {x.shape[-1]}/{y.shape[-1]}, "
-                f"indices={self.context_indices}"
+                f"[Data] Context concat to x only: x channels={x.shape[-1]}, "
+                f"y channels={y.shape[-1]} (weather only), indices={self.context_indices}"
             )
 
         self.x = x.astype(np.float32)
@@ -484,8 +483,8 @@ def create_data_loaders(
         context_altitude=context_altitude,
     )
 
-    total_target_dim = target_weather_dim + selected_context_dim
     input_feature_dim = target_weather_dim + selected_context_dim
+    total_target_dim = target_weather_dim
 
     result = {
         "train_loader": train_loader,

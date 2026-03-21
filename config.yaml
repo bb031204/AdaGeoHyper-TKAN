@@ -21,11 +21,11 @@ data:
     use_year: true                      # 年
     use_month: true                     # 月
     use_day: true                       # 日
-    use_time: false                     # 时间窗内索引
+    use_time: true                     # 时间窗内索引
     use_region: true                   # 陆地覆盖比例/陆海掩码类特征 (0~1)
-    use_altitude: false                 # 海拔
-    use_longitude: false                # 经度
-    use_latitude: false                 # 纬度
+    use_altitude: true                 # 海拔
+    use_longitude: true                # 经度
+    use_latitude: true                 # 纬度
 
 # ---- 超图配置 ----
 hypergraph:

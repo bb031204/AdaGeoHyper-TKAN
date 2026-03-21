@@ -1,0 +1,97 @@
+[2026-03-21 14:52:25] [INFO] 日志文件: D:/bishe/AdaGeoHyper-TKAN/outputs\20260321_145225_temperature\train_20260321_145225.log
+[2026-03-21 14:52:25] [INFO] ============================================================
+[2026-03-21 14:52:25] [INFO] AdaGeoHyper-TKAN 训练启动
+[2026-03-21 14:52:25] [INFO] ============================================================
+[2026-03-21 14:52:25] [INFO] 数据集: temperature
+[2026-03-21 14:52:25] [INFO] 要素: Temperature, 生效k=6, config_k=6, degree_clamp_min=1e-06, float32_norm=False
+[2026-03-21 14:52:25] [INFO] 输出目录: D:/bishe/AdaGeoHyper-TKAN/outputs\20260321_145225_temperature
+[2026-03-21 14:52:25] [INFO] [种子] 随机种子设置为 42 (cudnn.benchmark=True, TF32=high)
+[2026-03-21 14:52:25] [INFO] [设备] GPU: NVIDIA GeForce RTX 5070 Laptop GPU, 显存: 8.0GB
+[2026-03-21 14:52:25] [INFO] [配置] 配置快照已保存: D:/bishe/AdaGeoHyper-TKAN/outputs\20260321_145225_temperature\config_snapshot.yaml
+[2026-03-21 14:52:25] [INFO] [数据] 数据目录: D:/bishe/WYB\temperature
+[2026-03-21 14:52:27] [INFO] [Data] Station sampling: 2048 -> 1028
+[2026-03-21 14:52:37] [INFO] [Data] Context enabled: ['year', 'month', 'day', 'time', 'region', 'altitude', 'latitude', 'longitude'] (indices=[0, 1, 2, 3, 4, 5, 6, 7]), input channels 1 -> 9
+[2026-03-21 14:52:37] [INFO] [Data] Using context altitude channel for graph, range=[-28.95, 4910.14]
+[2026-03-21 14:52:37] [INFO] [Data] Loading trn: D:/bishe/WYB\temperature\trn.pkl
+[2026-03-21 14:52:41] [INFO] [Data] Station sampling by fixed indices: 1028
+[2026-03-21 14:52:50] [INFO] [Data] Context concat to x only: x channels=9, y channels=1 (weather only), indices=[0, 1, 2, 3, 4, 5, 6, 7]
+[2026-03-21 14:52:51] [INFO] [Data] Final trn: x=(2300, 12, 1028, 9), y=(2300, 12, 1028, 1)
+[2026-03-21 14:52:51] [INFO] [Data] Loading val: D:/bishe/WYB\temperature\val.pkl
+[2026-03-21 14:52:52] [INFO] [Data] Station sampling by fixed indices: 1028
+[2026-03-21 14:52:53] [INFO] [Data] Context concat to x only: x channels=9, y channels=1 (weather only), indices=[0, 1, 2, 3, 4, 5, 6, 7]
+[2026-03-21 14:52:53] [INFO] [Data] Final val: x=(329, 12, 1028, 9), y=(329, 12, 1028, 1)
+[2026-03-21 14:52:53] [INFO] [Data] Loading test: D:/bishe/WYB\temperature\test.pkl
+[2026-03-21 14:52:54] [INFO] [Data] Station sampling by fixed indices: 1028
+[2026-03-21 14:52:56] [INFO] [Data] Context concat to x only: x channels=9, y channels=1 (weather only), indices=[0, 1, 2, 3, 4, 5, 6, 7]
+[2026-03-21 14:52:57] [INFO] [Data] Final test: x=(657, 12, 1028, 9), y=(657, 12, 1028, 1)
+[2026-03-21 14:52:57] [INFO] [Data] Loading positions: D:/bishe/WYB\temperature\position.pkl
+[2026-03-21 14:52:57] [INFO] [Data] Positions with altitude (context channel 5), shape=(1028, 3)
+[2026-03-21 14:52:57] [INFO] [Data] Data loading done
+[2026-03-21 14:52:57] [INFO]   Element: Temperature, normalize=True, kelvin_to_celsius=True, weather_scaler=standard, context_scaler=standard
+[2026-03-21 14:52:57] [INFO]   Train samples: 2300
+[2026-03-21 14:52:57] [INFO]   Val samples: 329
+[2026-03-21 14:52:57] [INFO]   Test samples: 657
+[2026-03-21 14:52:57] [INFO]   Stations: 1028, input_dim=9, target_dim=1, weather_target_dim=1
+[2026-03-21 14:52:57] [INFO]   Position dim: 3
+[2026-03-21 14:52:57] [INFO] [模型] AdaGeoHyperTKAN 初始化完成:
+[2026-03-21 14:52:57] [INFO]   输入: [B, 12, N, 9]
+[2026-03-21 14:52:57] [INFO]   输出: [B, 12, N, 1]
+[2026-03-21 14:52:57] [INFO]   hidden_dim=64, tkan_hidden=64
+[2026-03-21 14:52:57] [INFO]   tkan_layers=2, hypergraph_layers=2
+[2026-03-21 14:52:57] [INFO]   k_neighbors=6
+[2026-03-21 14:52:57] [INFO] [模型] 模型参数量: 382,477 (可训练: 382,477)
+[2026-03-21 14:52:57] [INFO] [超图] ========== 超图构建信息 ==========
+[2026-03-21 14:52:57] [INFO] [超图] 位置维度: 3D (lonlat_alt) -> 经度(lon) + 纬度(lat) + 海拔(alt)
+[2026-03-21 14:52:57] [INFO] [超图] 站点数: 1028, K近邻: 6
+[2026-03-21 14:52:57] [INFO] [超图] λ_geo=1.0, λ_alt=0.5
+[2026-03-21 14:52:57] [INFO] [超图] 命中缓存:
+[2026-03-21 14:52:57] [INFO] [超图]   路径: d:\bishe\AdaGeoHyper-TKAN\cache\hypergraph_lonlat_alt_840fa05344172e464aa494721a7988d5.pkl
+[2026-03-21 14:52:57] [INFO] [超图]   文件: hypergraph_lonlat_alt_840fa05344172e464aa494721a7988d5.pkl
+[2026-03-21 14:52:57] [INFO] [超图]   构建维度: 3D (lonlat_alt)
+[2026-03-21 14:52:57] [INFO] [超图]   站点数=1028, K=6
+[2026-03-21 14:52:57] [INFO] [超图] ========== 超图就绪 ==========
+[2026-03-21 14:52:57] [INFO] [超图] N=1028, K=6, edges=1028, dim=3D (经度(lon) + 纬度(lat) + 海拔(alt))
+[2026-03-21 14:53:00] [INFO] [Compile] torch.compile 已启用 (inductor backend)
+[2026-03-21 14:53:00] [INFO] [AMP] 混合精度训练已启用 (float16)
+[2026-03-21 14:53:00] [INFO] [显存] 预估峰值: ~0.3GB, GPU 可用: 8.0GB
+[2026-03-21 14:53:00] [INFO] 
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[2026-03-21 14:53:00] [INFO]                                   TRAINING                                
+[2026-03-21 14:53:00] [INFO]   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[2026-03-21 14:53:00] [INFO]     Element: Temperature  │  Effective K: 6  │  Config K: 6
+[2026-03-21 14:53:00] [INFO]     Epochs: 100  │  Batch: 16  │  Early Stop: On (patience=15)  │  AMP: On
+[2026-03-21 14:53:00] [INFO]   ────────────────────────────────────────────────────────────────────────
+[2026-03-21 14:53:00] [INFO]     ⏳ torch.compile 首次编译 (前向+反向, 仅一次, 约 5~10 分钟)...
+[2026-03-21 14:55:33] [INFO]     [Warmup] train fwd+bwd 完成, 用时 152.8s
+[2026-03-21 14:56:35] [INFO]     [Warmup] val fwd 完成, 用时 62.2s
+[2026-03-21 14:59:50] [INFO]     [Warmup] train tail bs=12 完成, 用时 195.0s
+[2026-03-21 15:01:09] [INFO]     [Warmup] val tail bs=9 完成, 用时 79.1s
+[2026-03-21 15:01:09] [INFO]     [Warmup] restore state 完成, 用时 0.0s
+[2026-03-21 15:01:10] [INFO]     ✓ 编译完成 (490s), 后续 epoch 无需重复编译
+[2026-03-21 15:01:10] [INFO] 
+[2026-03-21 15:05:35] [INFO] Epoch   1/100 | Train: 0.164602 | Val: 0.025681 | MAE: 2.3755 | RMSE: 3.2777 | MAPE: 152.71% | LR: 1.00e-03 | 265s | New Best
+[2026-03-21 15:05:35] [INFO] [保存] 最佳模型已保存 (epoch 1, val_loss=0.025681)
+[2026-03-21 15:10:04] [INFO] Epoch   2/100 | Train: 0.040858 | Val: 0.024806 | MAE: 2.3766 | RMSE: 3.2186 | MAPE: 131.04% | LR: 1.00e-03 | 269s | New Best (-0.000875)
+[2026-03-21 15:10:04] [INFO] [保存] 最佳模型已保存 (epoch 2, val_loss=0.024806)
+[2026-03-21 15:14:34] [INFO] Epoch   3/100 | Train: 0.032383 | Val: 0.019992 | MAE: 2.1129 | RMSE: 2.8910 | MAPE: 126.42% | LR: 9.99e-04 | 270s | New Best (-0.004814)
+[2026-03-21 15:14:34] [INFO] [保存] 最佳模型已保存 (epoch 3, val_loss=0.019992)
+[2026-03-21 15:19:04] [INFO] Epoch   4/100 | Train: 0.028456 | Val: 0.021494 | MAE: 2.1200 | RMSE: 2.9934 | MAPE: 118.56% | LR: 9.98e-04 | 270s | 
+[2026-03-21 15:23:34] [INFO] Epoch   5/100 | Train: 0.025826 | Val: 0.018795 | MAE: 2.0292 | RMSE: 2.8017 | MAPE: 122.15% | LR: 9.96e-04 | 270s | New Best (-0.001197)
+[2026-03-21 15:23:34] [INFO] [保存] 最佳模型已保存 (epoch 5, val_loss=0.018795)
+[2026-03-21 15:28:04] [INFO] Epoch   6/100 | Train: 0.023753 | Val: 0.019059 | MAE: 2.1208 | RMSE: 2.8229 | MAPE: 111.73% | LR: 9.94e-04 | 270s | 
+[2026-03-21 15:32:36] [INFO] Epoch   7/100 | Train: 0.022243 | Val: 0.016293 | MAE: 1.8480 | RMSE: 2.6088 | MAPE: 108.29% | LR: 9.91e-04 | 272s | New Best (-0.002502)
+[2026-03-21 15:32:36] [INFO] [保存] 最佳模型已保存 (epoch 7, val_loss=0.016293)
+[2026-03-21 15:37:06] [INFO] Epoch   8/100 | Train: 0.020537 | Val: 0.012842 | MAE: 1.6339 | RMSE: 2.3166 | MAPE: 91.25% | LR: 9.88e-04 | 270s | New Best (-0.003451)
+[2026-03-21 15:37:06] [INFO] [保存] 最佳模型已保存 (epoch 8, val_loss=0.012842)
+[2026-03-21 15:41:36] [INFO] Epoch   9/100 | Train: 0.018834 | Val: 0.012009 | MAE: 1.5968 | RMSE: 2.2389 | MAPE: 82.26% | LR: 9.84e-04 | 271s | New Best (-0.000833)
+[2026-03-21 15:41:36] [INFO] [保存] 最佳模型已保存 (epoch 9, val_loss=0.012009)
+[2026-03-21 15:46:06] [INFO] Epoch  10/100 | Train: 0.017384 | Val: 0.011692 | MAE: 1.6176 | RMSE: 2.2096 | MAPE: 79.57% | LR: 9.80e-04 | 270s | New Best (-0.000317)
+[2026-03-21 15:46:06] [INFO] [保存] 最佳模型已保存 (epoch 10, val_loss=0.011692)
+[2026-03-21 15:50:36] [INFO] Epoch  11/100 | Train: 0.016325 | Val: 0.010605 | MAE: 1.4947 | RMSE: 2.1036 | MAPE: 81.05% | LR: 9.76e-04 | 270s | New Best (-0.001086)
+[2026-03-21 15:50:36] [INFO] [保存] 最佳模型已保存 (epoch 11, val_loss=0.010605)
+[2026-03-21 15:55:03] [INFO] Epoch  12/100 | Train: 0.015620 | Val: 0.010215 | MAE: 1.4629 | RMSE: 2.0646 | MAPE: 76.48% | LR: 9.70e-04 | 266s | New Best (-0.000390)
+[2026-03-21 15:55:03] [INFO] [保存] 最佳模型已保存 (epoch 12, val_loss=0.010215)
+[2026-03-21 15:59:20] [INFO] Epoch  13/100 | Train: 0.015094 | Val: 0.009601 | MAE: 1.3838 | RMSE: 2.0024 | MAPE: 74.16% | LR: 9.65e-04 | 258s | New Best (-0.000614)
+[2026-03-21 15:59:20] [INFO] [保存] 最佳模型已保存 (epoch 13, val_loss=0.009601)
+[2026-03-21 16:03:32] [INFO] Epoch  14/100 | Train: 0.014423 | Val: 0.009254 | MAE: 1.3672 | RMSE: 1.9657 | MAPE: 81.41% | LR: 9.59e-04 | 252s | New Best (-0.000348)
+[2026-03-21 16:03:33] [INFO] [保存] 最佳模型已保存 (epoch 14, val_loss=0.009254)

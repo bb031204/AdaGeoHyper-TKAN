@@ -1,0 +1,65 @@
+data:
+  context_features:
+    use_altitude: true
+    use_day: true
+    use_latitude: true
+    use_longitude: true
+    use_month: true
+    use_region: true
+    use_time: true
+    use_year: true
+  data_root: D:/bishe/WYB
+  dataset_name: temperature
+  element: Temperature
+  include_context: true
+  input_len: 12
+  num_stations: 1028
+  pred_len: 12
+  sample_ratio: 1.0
+  test_sample_ratio: 1.0
+  val_sample_ratio: 1.0
+hypergraph:
+  cache_dir: cache
+  degree_clamp_min: 1.0e-06
+  float32_norm: false
+  k_neighbors: 6
+  lambda_alt: 0.5
+  lambda_geo: 1.0
+  scorer_hidden_dim: 32
+  summary_pool: mean
+  use_context_altitude: true
+  use_hypergraph_cache: true
+model:
+  dropout: 0.1
+  fusion_dim: 64
+  hidden_dim: 64
+  hypergraph_layers: 2
+  kan_grid_size: 5
+  kan_spline_order: 3
+  tkan_chunk_size: 0
+  tkan_hidden_dim: 64
+  tkan_layers: 2
+  tkan_sub_kan_configs:
+  - null
+  - 3
+  use_gradient_checkpoint: false
+output:
+  log_interval: 10
+  output_dir: D:/bishe/AdaGeoHyper-TKAN/outputs
+  resume_from_checkpoint: null
+  save_best_only: true
+training:
+  batch_size: 16
+  device: cuda
+  epochs: 100
+  grad_clip: 1.0
+  learning_rate: 0.001
+  patience: 15
+  scheduler: cosine
+  scheduler_gamma: 0.5
+  scheduler_step_size: 20
+  seed: 42
+  use_amp: true
+  use_compile: true
+  use_early_stop: true
+  weight_decay: 0.0001
