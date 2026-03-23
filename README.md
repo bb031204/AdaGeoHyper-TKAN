@@ -8,6 +8,9 @@
 
 - [1. 项目概览](#1-项目概览)
 - [2. 核心特性](#2-核心特性)
+- [2.1 数据流输出图](#21-数据流输出图)
+- [2.2 模型结构说明模块](#22-模型结构说明模块)
+- [2.3 模型结构图](#23-模型结构图)
 - [3. 项目结构](#3-项目结构)
 - [4. 环境安装](#4-环境安装)
 - [5. 数据格式与加载逻辑](#5-数据格式与加载逻辑)
@@ -56,6 +59,131 @@ AdaGeoHyper-TKAN 的总体流程：
   - 风速额外：VectorMAE / VectorRMSE
 - 训练终端可视化：
   - 每个 epoch 输出动态K范围、均值、中位数、保留率
+
+### 2.1 数据流输出图
+
+```text
+[raw pkl 数据]
+  trn/val/test: x, y, context
+  position.pkl: lon/lat/(alt)
+        │
+        ▼
+[数据加载与预处理 utils/data_loader.py]
+  - 站点采样 / 样本采样
+  - 温度 K→°C（按要素）
+  - weather scaler(train fit, val/test transform)
+  - context 周期特征 sin/cos + context scaler
+  - x拼接context，y保持weather-only
+        │
+        ├──────────────► 产物A: DataLoader(train/val/test)
+        ├──────────────► 产物B: preprocessing_artifact.pkl
+        └──────────────► 产物C: positions(N,2/3)
+                              │
+                              ▼
+[模型前向 AdaGeoHyperTKAN]
+  输入: x [B, Tin, N, F]
+  1) AdaptiveGeoHypergraph  -> H_s [B, Tin, N, D]
+  2) TKAN                   -> H_t [B, Tin, N, D]
+  3) GatedFusion            -> H_fused [B, Tin, N, D]
+  4) PredictionHead         -> y_pred [B, Tout, N, C]
+                              │
+                              ▼
+[训练 train.py]
+  - loss(可配 l1/huber/mse)
+  - 反向传播 + scheduler + early stop
+  - 记录动态K统计(range/mean/median/keep)
+  - 保存 checkpoint(best/latest)
+                              │
+                              ▼
+[预测 predict.py]
+  - 加载 best_model + preprocessing_artifact
+  - 反标准化后评估 MAE/RMSE/sMAPE/WMAPE/MAPE
+  - 风速额外 VectorMAE/VectorRMSE
+  - 导出 summary / 图表 / npz
+```
+
+### 2.2 模型结构说明模块
+
+#### 模块A：AdaptiveGeoHypergraph（空间模块）
+
+- 输入：`x [B, Tin, N, F]`，站点位置 `positions [N, 2/3]`
+- 核心：
+  - KNN 构建候选邻域（`k_neighbors = K_max`）
+  - 自适应打分 `φ([p_i,p_j,s_i,s_j])`
+  - softmax 权重后可做动态裁剪（`top_p/threshold`）
+- 输出：`H_s [B, Tin, N, D]`
+
+#### 模块B：TKAN（时间模块）
+
+- 输入：`x [B, Tin, N, F]`
+- 核心：
+  - TKANCell 堆叠建模时间依赖
+  - KANLinear 提升非线性表达能力
+- 输出：`H_t [B, Tin, N, D]`
+
+#### 模块C：GatedFusion（时空融合）
+
+- 输入：`H_s` 与 `H_t`
+- 核心：学习门控权重 `z`，自适应融合空间/时间特征
+- 输出：`H_fused [B, Tin, N, D]`
+
+#### 模块D：PredictionHead（多步预测头）
+
+- 输入：`H_fused [B, Tin, N, D]`
+- 核心：按站点展平时间维后经 MLP 映射到 `Tout*C`
+- 输出：`y_pred [B, Tout, N, C]`
+
+#### 模块间接口一览
+
+- `Hypergraph`: `[B,T,N,F] -> [B,T,N,D]`
+- `TKAN`: `[B,T,N,F] -> [B,T,N,D]`
+- `Fusion`: `([B,T,N,D],[B,T,N,D]) -> [B,T,N,D]`
+- `Head`: `[B,T,N,D] -> [B,Tout,N,C]`
+
+### 2.3 模型结构图
+
+```text
+                           AdaGeoHyper-TKAN (12 -> 12)
+
+输入 X [B, Tin, N, F]  ────────────────────────────────────────────────────────────────┐
+  (weather + optional context)                                                          │
+                                                                                         │
+                       ┌─────────────────────────────────────────────┐                    │
+                       │ AdaptiveGeoHypergraph (空间分支)            │                    │
+                       │ - KNN 超图骨架 (lon/lat/alt)               │                    │
+                       │ - 自适应权重 scorer + dynamic K pruning     │                    │
+                       │ - Hypergraph Conv x L                       │                    │
+                       └──────────────────────┬──────────────────────┘                    │
+                                              │ H_s [B,Tin,N,D]                           │
+                                              │                                            │
+                                              │                                            │
+                       ┌──────────────────────▼──────────────────────┐                    │
+                       │ TKAN (时间分支)                              │                    │
+                       │ - TKANCell x Lt                              │                    │
+                       │ - KANLinear 非线性时间映射                  │                    │
+                       └──────────────────────┬──────────────────────┘                    │
+                                              │ H_t [B,Tin,N,D]                           │
+                                              │                                            │
+                                ┌─────────────▼─────────────┐                              │
+                                │ GatedFusion               │                              │
+                                │ z = σ(Ws·Hs + Wt·Ht + b) │                              │
+                                │ H = z·Hs + (1-z)·Ht      │                              │
+                                └─────────────┬─────────────┘                              │
+                                              │ H_fused [B,Tin,N,D]                        │
+                                              ▼                                            │
+                                ┌───────────────────────────┐                               │
+                                │ PredictionHead (MLP)      │                               │
+                                │ flatten(Tin*D per station)│                               │
+                                │ -> Tout*C                 │                               │
+                                └─────────────┬─────────────┘                               │
+                                              ▼                                            │
+                                      输出 Ŷ [B,Tout,N,C]                                   │
+```
+
+> 说明：
+> - `Tin=12`, `Tout=12`（默认）
+> - `D` 为隐藏维度（`model.hidden_dim`）
+> - `C` 为目标通道数（温度/湿度/云量=1，风速=2）
 
 ---
 
@@ -197,6 +325,13 @@ pip install numpy scipy pyyaml matplotlib tqdm scikit-learn
   - 可选再加：`latitude/longitude`
   - 先关：`region`
 
+参数范围的物理意义：
+- `K_max`：决定每站点可感知的最大空间作用半径。温度主要受局地辐射、地形与下垫面影响，`K_max` 过大等于把远距离异质气团混入局地估计，容易拉低信噪比。
+- `top_p`：控制保留的“有效相互作用质量”。`top_p` 越低，模型越强调少数主导邻居（更接近局地传输）；越高则纳入更多弱联系（更平滑但可能引噪）。
+- `min_keep`：保证最小连通，避免极端天气或权重塌缩时图传播断裂。
+- `robust_preprocess q`：仅用于 scaler 拟合的分位截断，抑制极端离群值对尺度估计的污染，不改变原始监督目标。
+- context 取舍：`month/day/time` 对应季节-日变化与昼夜辐射周期；`altitude/lat/lon` 提供静态地形背景；`region` 为粗粒度分类，若边界效应强可能引入硬分区偏置。
+
 说明：温度任务引入过远邻居容易带来噪声，动态K均值建议落在约 4.5~6。
 
 ### 8.2 湿度（humidity）
@@ -209,6 +344,13 @@ pip install numpy scipy pyyaml matplotlib tqdm scikit-learn
 - `loss_type`: `huber`（更抗异常）
 - `robust_preprocess`: `q=[0.005, 0.995]`
 - context 优先：`month/day/time/region`
+
+参数范围的物理意义：
+- `K_max`：湿度受边界层混合、地形遮挡和局地水汽源影响显著，空间相关长度通常短于风场；较小 `K_max` 更符合局地水汽传输尺度。
+- `top_p`：较低区间（0.65~0.75）让模型优先保留高置信邻居，减少“远邻同化”造成的虚假平滑。
+- `loss_type=huber`：对偶发极端湿度误差更稳，避免少量异常样本主导梯度。
+- `robust_preprocess q=[0.005,0.995]`：湿度分布常在高湿端聚集，适度收紧分位可稳定尺度估计。
+- context 中 `region`：在海陆过渡、城市群与地形分区明显区域，可提供边界层类型先验。
 
 说明：湿度对局地和边界层条件敏感，过大K常导致收敛慢、误差平台高。
 
@@ -223,6 +365,13 @@ pip install numpy scipy pyyaml matplotlib tqdm scikit-learn
 - `robust_preprocess`: `q=[0.005, 0.995]`
 - context 优先：`month/day/time/region/lat/lon`
 
+参数范围的物理意义：
+- `K_max`：云系受中尺度到天气尺度系统共同驱动（锋面、槽脊、对流组织），中等偏大 `K_max` 有助于覆盖更长的相关尺度。
+- `top_p`：取中高区间表示保留更多弱联系，模拟云场的连续扩展与团簇传播；过低会过度局地化，削弱云带连续性。
+- `loss_type=huber`：对局地强对流导致的突变误差更鲁棒。
+- `robust_preprocess`：云量接近0或1时分布偏态明显，分位稳健拟合可避免尺度失真。
+- context 中 `lat/lon/region`：对应大尺度环流带与下垫面差异，可提升空间分型能力。
+
 说明：云量受大尺度过程影响较明显，适度保留远邻可能有益。
 
 ### 8.4 风速（component_of_wind）
@@ -236,16 +385,52 @@ pip install numpy scipy pyyaml matplotlib tqdm scikit-learn
 - 指标重点看：`VectorMAE / VectorRMSE`
 - context 优先：`time/altitude/lat/lon`
 
+参数范围的物理意义：
+- `K_max`：风是矢量场，受大尺度压强梯度与地形导流共同影响，相关长度通常更长；较大 `K_max` 能覆盖主导流线与下游传播关系。
+- `top_p`：中高区间可保留多方向输送路径，避免仅保留单一局地主导边导致方向信息丢失。
+- `min_keep=3`：保证至少多方向连接，减少矢量场在稀疏图下的方向退化。
+- `VectorMAE/VectorRMSE`：直接度量(u,v)向量误差，比仅看标量分量更符合物理风场质量。
+- context 中 `alt/lat/lon/time`：对应地形摩擦、纬向环流背景与日变化边界层风切变。
+
 说明：风场空间连通性更强，适当较大K通常比温湿更稳定。
 
-### 8.5 训练全局建议取值范围
+### 8.5 损失函数特点与推荐（按要素）
+
+#### L1（MAE）
+- 特点：直接优化绝对误差，对离群点比 MSE 更稳；与 MAE 指标一致。
+- 适用：当主目标是把 MAE 压到更低（尤其温度任务）。
+- 注意：曲线可能比 MSE 略抖，建议配合合适学习率（如 1e-3~3e-3）。
+
+#### Huber
+- 特点：小误差区近似 MSE、大误差区近似 L1，兼顾平滑优化与抗异常值能力。
+- 适用：湿度/云量/风速这类突变或异常值更常见的任务。
+- 参数：`huber_delta` 常用 1.0；若重尾噪声更明显，可尝试 0.5~0.8。
+
+#### MSE
+- 特点：对大误差惩罚更重，通常更利于优化 RMSE。
+- 适用：噪声较小、以 RMSE 为主目标时。
+- 注意：对离群点敏感，可能牺牲 MAE 稳定性。
+
+#### 推荐起点（本项目）
+- `temperature`：优先 `l1`，备选 `huber`
+- `humidity`：优先 `huber`
+- `cloud_cover`：优先 `huber`
+- `component_of_wind`：优先 `huber`（并同时关注 `VectorMAE/VectorRMSE`）
+
+### 8.6 训练全局建议取值范围
 
 - `learning_rate`: 1e-3 ~ 5e-3
+  - 物理含义：不是物理量本身，而是参数更新步长；过大易在多尺度过程下振荡，过小则难以追踪快速天气过程。
 - `batch_size`（8GB显存）：8 ~ 16
+  - 统计含义：控制梯度估计方差与时空样本混合程度；更大 batch 更平滑但显存压力更高。
 - `dropout`: 0.05 ~ 0.2
+  - 作用含义：抑制对个别站点/时段噪声的过拟合，过高会损失有效物理相关性。
 - `grad_clip`: 0.5 ~ 2.0
+  - 稳定含义：限制极端样本导致的梯度尖峰，防止训练不稳定。
 - `patience`: 15 ~ 35（湿度/风速可适当更大）
+  - 收敛含义：多变量/矢量任务通常收敛更慢，需要更长观测窗口判断是否真正停滞。
 - `use_amp`: true（推荐）
+  - 数值含义：提高吞吐并降低显存占用，通常不改变物理建模结论。
 - `use_compile`: 
   - Linux: 可开
   - Windows: 建议先关或使用自动回退机制

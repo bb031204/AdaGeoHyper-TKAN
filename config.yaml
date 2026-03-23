@@ -12,7 +12,7 @@ data:
   data_root: "D:/bishe/WYB"            # 数据根目录
   input_len: 12                         # 输入时间步长
   pred_len: 12                          # 预测时间步长
-  num_stations: 1028                    # null=使用全部站点(2048); 也可设为 512/1024
+  num_stations: 1100                    # null=使用全部站点(2048); 也可设为 512/1024
   sample_ratio: 1.0                     # 训练集样本采样比例 (0~1)
   val_sample_ratio: 1.0                 # 验证集样本采样比例
   test_sample_ratio: 1.0                # 测试集样本采样比例
@@ -22,14 +22,14 @@ data:
     use_month: true                     # 月
     use_day: true                       # 日
     use_time: true                     # 时间窗内索引
-    use_region: true                   # 陆地覆盖比例/陆海掩码类特征 (0~1)
+    use_region: false                   # 陆地覆盖比例/陆海掩码类特征 (0~1)
     use_altitude: true                 # 海拔
     use_longitude: true                 # 经度
     use_latitude: true                 # 纬度
 
 # ---- 超图配置 ----
 hypergraph:
-  k_neighbors: 12                       # 候选邻域 K_max（方案3：动态裁剪在此基础上保留有效邻居）
+  k_neighbors: 11                       # 候选邻域 K_max（方案3：动态裁剪在此基础上保留有效邻居）
   lambda_geo: 1.0                       # 地理平面距离权重
   lambda_alt: 0.5                       # 海拔差权重
   use_context_altitude: true            # position.pkl 无海拔时，是否用 context 第5通道作为海拔
@@ -40,9 +40,9 @@ hypergraph:
   dynamic_pruning:
     enabled: true                       # 启用权重稀疏化动态裁剪超图
     mode: "top_p"                      # top_p / threshold
-    top_p: 0.72                         # 累积权重阈值（top_p 模式）
+    top_p: 0.75                         # 累积权重阈值（top_p 模式）
     threshold: 0.05                     # 权重阈值（threshold 模式）
-    min_keep: 2                         # 每个站点至少保留邻居数（防断连）
+    min_keep: 3                         # 每个站点至少保留邻居数（防断连）
 
 # ---- 模型配置 ----
 model:
@@ -62,7 +62,7 @@ model:
 training:
   batch_size: 16                        # 批大小
   epochs: 100                            # 训练轮数
-  learning_rate: 0.005                  # 学习率
+  learning_rate: 0.003                  # 学习率
   weight_decay: 0.0001                  # 权重衰减
   device: "cuda"                        # cuda / auto / cpu
   seed: 42                              # 随机种子
@@ -72,11 +72,13 @@ training:
   scheduler_step_size: 20               # StepLR 步长
   scheduler_gamma: 0.5                  # StepLR 衰减因子
   grad_clip: 1.0                        # 梯度裁剪阈值
-  loss_type: "huber"                    # 损失函数: mse / l1 / huber /mae？？
+  loss_type: "l1"                    # 损失函数: mse / l1 / huber /mae？？
   huber_delta: 1.0                      # HuberLoss delta (仅 loss_type=huber 时生效)
   warmup_epochs: 0                      # 学习率 warmup 轮数 (0=不启用)
   use_amp: true                         # 是否启用 AMP 混合精度
-  use_compile: false                     # 是否启用 torch.compile 编译加速 (需 PyTorch 2.0+)
+  use_compile: true                     # 是否启用 torch.compile 编译加速 (需 PyTorch 2.0+)
+  compile_warmup: true                  # 是否执行 compile 预热（前向+反向预编译）
+  compile_warmup_tail_shapes: true      # 是否预编译尾 batch 形状（避免 143/144 这类尾步等待）
 
 # ---- 输出配置 ----
 output:

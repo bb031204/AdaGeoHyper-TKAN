@@ -1,4 +1,4 @@
-"""
+﻿"""
 Main entry for AdaGeoHyper-TKAN.
 """
 
@@ -151,6 +151,43 @@ def override_config(config: dict, args) -> dict:
     return config
 
 
+def resolve_train_config_path(cli_config: str) -> str:
+    """训练优先使用固定 outputs 快照配置，不再创建临时配置文件。"""
+    preferred_snapshot = r"D:/bishe/AdaGeoHyper-TKAN/outputs/20260323_091932_temperature/config_snapshot.yaml"
+
+    if cli_config and cli_config != "config.yaml":
+        config_path = _resolve_path(cli_config)
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"训练配置文件不存在: {config_path}")
+        return config_path
+
+    if os.path.exists(preferred_snapshot):
+        return preferred_snapshot
+
+    default_config = _resolve_path("config.yaml")
+    if os.path.exists(default_config):
+        return default_config
+
+    raise FileNotFoundError(
+        f"未找到可用训练配置。已尝试: {preferred_snapshot} 与 {default_config}"
+    )
+
+
+def _has_cli_overrides(args) -> bool:
+    return any([
+        args.dataset is not None,
+        args.element is not None,
+        args.dataset_selection is not None,
+        args.device is not None,
+        args.batch_size is not None,
+        args.epochs is not None,
+        args.lr is not None,
+        args.num_stations is not None,
+        args.sample_ratio is not None,
+        args.seed is not None,
+    ])
+
+
 def main():
     args = parse_args()
 
@@ -176,41 +213,33 @@ def main():
             run_predict(args.output_dir, predict_config_path)
             return
 
-        config_path = _resolve_path(args.config)
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(f"配置文件不存在: {config_path}")
+        config_path = resolve_train_config_path(args.config)
+        print(f"[配置] 训练使用配置: {config_path}")
 
         config = load_config(config_path)
-        config = override_config(config, args)
         validate_config(config)
+        if _has_cli_overrides(args):
+            raise ValueError(
+                "当前模式已禁用临时配置文件。请直接修改配置文件后重试，"
+                "或在 future 版本开启显式 override 模式。"
+            )
 
-        import tempfile
-        import yaml
+        if args.mode == "train":
+            run_train(config_path)
+        else:
+            print("\n[Phase 1] 训练...")
+            output_dir, best_val_loss = run_train(config_path)
 
-        tmp_config = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, dir=project_root)
-        yaml.dump(config, tmp_config, default_flow_style=False, allow_unicode=True)
-        tmp_config_path = tmp_config.name
-        tmp_config.close()
+            predict_config_path = os.path.join(output_dir, "config_snapshot.yaml")
+            print(f"\n[Phase 2] 预测... (output_dir: {output_dir})")
+            print(f"[配置] 预测使用配置: {predict_config_path}")
+            run_predict(output_dir, predict_config_path)
 
-        try:
-            if args.mode == "train":
-                run_train(tmp_config_path)
-            else:
-                print("\n[Phase 1] 训练...")
-                output_dir, best_val_loss = run_train(tmp_config_path)
-
-                predict_config_path = os.path.join(output_dir, "config_snapshot.yaml")
-                print(f"\n[Phase 2] 预测... (output_dir: {output_dir})")
-                print(f"[配置] 预测使用配置: {predict_config_path}")
-                run_predict(output_dir, predict_config_path)
-
-                print("\n" + "=" * 60)
-                print("  全流程完成!")
-                print(f"  最优验证损失: {best_val_loss:.6f}")
-                print(f"  输出目录: {output_dir}")
-                print("=" * 60)
-        finally:
-            os.unlink(tmp_config_path)
+            print("\n" + "=" * 60)
+            print("  全流程完成!")
+            print(f"  最优验证损失: {best_val_loss:.6f}")
+            print(f"  输出目录: {output_dir}")
+            print("=" * 60)
 
     except (ValueError, KeyError, FileNotFoundError) as e:
         print(f"[配置错误] {e}")

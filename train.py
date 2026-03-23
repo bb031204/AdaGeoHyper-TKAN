@@ -754,6 +754,8 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
     # ---- 编译 warmup: 前向 + 反向全量编译, 避免训练循环内阻塞 ----
     _is_compiled = hasattr(model, "_orig_mod")
     _compile_active = _is_compiled
+    # Windows 下 warmup 体感时间很长，默认关闭；可在 config.training.compile_warmup 显式开启
+    _enable_compile_warmup = bool(config["training"].get("compile_warmup", os.name != "nt"))
 
     def _fallback_disable_compile(reason: str):
         nonlocal model, _compile_active
@@ -762,7 +764,7 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
             _compile_active = False
             logger.warning(f"[Compile] 自动回退到 eager 模式: {reason}")
 
-    if _is_compiled and device.type == "cuda":
+    if _is_compiled and device.type == "cuda" and _enable_compile_warmup:
         tqdm_log(f"    {C.YELLOW}⏳ torch.compile 首次编译 (前向+反向, 仅一次, 约 5~10 分钟)...{C.RESET}")
         _warmup_start = time.time()
 
@@ -777,14 +779,22 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         _train_tail_bs = len(train_loader.dataset) % _bs
         _val_tail_bs = len(val_loader.dataset) % _bs
         _warmup_steps = 3
-        # Windows + torch.compile 下，tail-shape 预编译可能触发 cl 工具链错误，默认跳过
-        _enable_tail_warmup = (os.name != "nt")
+        # tail-shape 预编译开关：默认 Linux/macOS 开启，Windows 默认关闭，可显式配置打开
+        _enable_tail_warmup = bool(config["training"].get("compile_warmup_tail_shapes", os.name != "nt"))
         if _enable_tail_warmup and 0 < _train_tail_bs < _sample_x.shape[0]:
             _warmup_steps += 1
         if _enable_tail_warmup and 0 < _val_tail_bs < _sample_x.shape[0]:
             _warmup_steps += 1
+        if _enable_tail_warmup and os.name == "nt":
+            tqdm_log(f"    {C.YELLOW}↻ 已开启 tail-shape 预编译（Windows）: train_tail_bs={_train_tail_bs}, val_tail_bs={_val_tail_bs}{C.RESET}")
+        # 让 warmup 进度条在“阶段内”也推进，避免长阶段一直显示 0/x
+        _units_per_stage = 20
+        _warmup_total_units = _warmup_steps * _units_per_stage
+        _warmup_progress_units = 0
+        _warmup_stage_idx = 0
+
         _warmup_bar = tqdm(
-            total=_warmup_steps,
+            total=_warmup_total_units,
             desc=f"    {C.YELLOW}Warmup{C.RESET}",
             leave=False,
             ncols=120,
@@ -792,13 +802,23 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         )
 
         def _run_warmup_stage(stage_name: str, fn):
+            nonlocal _warmup_progress_units, _warmup_stage_idx
             stage_start = time.time()
             stop_event = threading.Event()
+            stage_unit_start = _warmup_stage_idx * _units_per_stage
+            stage_unit_end = stage_unit_start + _units_per_stage
 
             def _heartbeat():
+                nonlocal _warmup_progress_units
                 while not stop_event.wait(15):
                     stage_elapsed = time.time() - stage_start
                     total_elapsed = time.time() - _warmup_start
+                    # 每 15s 推进 1 格，最多推进到本阶段倒数第1格
+                    soft_units = min(_units_per_stage - 1, int(stage_elapsed // 15))
+                    target_units = stage_unit_start + soft_units
+                    if target_units > _warmup_progress_units:
+                        _warmup_bar.update(target_units - _warmup_progress_units)
+                        _warmup_progress_units = target_units
                     tqdm.write(
                         f"    [Warmup] {stage_name} 进行中... "
                         f"stage={stage_elapsed:.0f}s, total={total_elapsed:.0f}s"
@@ -817,7 +837,10 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
             _warmup_bar.set_postfix(
                 {"stage": stage_name, "last": f"{stage_elapsed:.1f}s", "total": f"{total_elapsed:.1f}s"}
             )
-            _warmup_bar.update(1)
+            if _warmup_progress_units < stage_unit_end:
+                _warmup_bar.update(stage_unit_end - _warmup_progress_units)
+                _warmup_progress_units = stage_unit_end
+            _warmup_stage_idx += 1
             tqdm_log(f"    [Warmup] {stage_name} 完成, 用时 {stage_elapsed:.1f}s")
 
         _warmup_failed = False
@@ -907,6 +930,8 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         del _sample_x, _sample_y, _saved_state
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    elif _is_compiled and device.type == "cuda" and not _enable_compile_warmup:
+        tqdm_log(f"    {C.YELLOW}⏭ 已跳过 compile warmup（Windows 默认）; 首个 batch 可能出现一次性编译等待{C.RESET}")
     elif device.type == "cuda":
         tqdm_log(f"    {C.YELLOW}⏳ 首个 batch 需 CUDA warmup, 可能等待 1~3 分钟...{C.RESET}")
     tqdm_log("")
