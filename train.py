@@ -381,6 +381,7 @@ def save_checkpoint(
     val_metrics_history: dict = None,
     no_improve_count: int = 0,
     config: dict = None,
+    adaptive_events: list = None,
 ):
     """保存 checkpoint (含完整训练历史, 支持暂停恢复)。"""
     # torch.compile 包装后的模型, 取原始模块的 state_dict 以保持兼容性
@@ -396,6 +397,7 @@ def save_checkpoint(
         "val_losses": val_losses or [],
         "val_metrics_history": val_metrics_history or {},
         "no_improve_count": no_improve_count,
+        "adaptive_events": adaptive_events or [],
         "config": config,
     }
 
@@ -427,7 +429,9 @@ def load_checkpoint(
     logger.info(f"[恢复] 从 checkpoint 恢复: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-    model.load_state_dict(checkpoint["model_state_dict"])
+    # 与保存逻辑保持一致：若当前是 torch.compile 包装模型，权重加载到原始模块
+    raw_model = getattr(model, "_orig_mod", model)
+    raw_model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     if scheduler and checkpoint.get("scheduler_state_dict"):
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -449,6 +453,7 @@ def load_checkpoint(
             },
         ),
         "no_improve_count": checkpoint.get("no_improve_count", 0),
+        "adaptive_events": checkpoint.get("adaptive_events", []),
     }
 
 
@@ -517,7 +522,30 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         output_dir = create_output_dir(config)
 
     # ---- 3. 设置日志 ----
-    setup_logger("AdaGeoHyperTKAN", log_dir=output_dir)
+    resume_log_path = None
+    if resume_output_dir and os.path.isdir(resume_output_dir):
+        try:
+            log_candidates = [
+                os.path.join(output_dir, f)
+                for f in os.listdir(output_dir)
+                if f.startswith("train_") and f.endswith(".log")
+            ]
+            if log_candidates:
+                log_candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                resume_log_path = log_candidates[0]
+        except OSError:
+            resume_log_path = None
+
+    if resume_log_path is not None:
+        setup_logger(
+            "AdaGeoHyperTKAN",
+            log_file_path=resume_log_path,
+            file_mode="a",
+        )
+        logger.info(f"[恢复] 复用日志文件: {resume_log_path}")
+    else:
+        setup_logger("AdaGeoHyperTKAN", log_dir=output_dir)
+
     logger.info("=" * 60)
     logger.info("AdaGeoHyper-TKAN 训练启动")
     logger.info("=" * 60)
@@ -659,14 +687,19 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
             except Exception as e:
                 logger.warning(f"[Compile] torch.compile 不可用, 跳过: {e}")
 
-    # ---- 11. 损失函数 ----
-    loss_type = config["training"].get("loss_type", "huber").strip().lower()
+    # ---- 11. 损失函数（对齐 hyper_kan：mae/l1, mse/l2, huber） ----
+    loss_type = str(config["training"].get("loss_type", "huber")).strip().lower()
     if loss_type in ("l1", "mae"):
         criterion = nn.L1Loss()
+    elif loss_type in ("mse", "l2"):
+        criterion = nn.MSELoss()
     elif loss_type == "huber":
         criterion = nn.HuberLoss(delta=config["training"].get("huber_delta", 1.0))
     else:
-        criterion = nn.MSELoss()
+        raise ValueError(
+            f"Unsupported training.loss_type='{loss_type}'. "
+            "Supported: ['mae', 'l1', 'mse', 'l2', 'huber']."
+        )
     logger.info(f"[Loss] {criterion.__class__.__name__}"
                 + (f" (delta={criterion.delta})" if hasattr(criterion, "delta") else ""))
 
@@ -688,6 +721,7 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         "MAE": [], "RMSE": [], "sMAPE": [], "WMAPE": [], "MAPE": [],
         "VectorMAE": [], "VectorRMSE": [],
     }
+    adaptive_events = []
 
     # 优先使用 pause_resume 传入的 checkpoint, 其次使用 config 中的
     resume_path = resume_checkpoint or config["output"].get("resume_from_checkpoint")
@@ -701,8 +735,10 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         val_losses = restored["val_losses"]
         val_metrics_history = restored["val_metrics_history"]
         no_improve_count = restored["no_improve_count"]
+        adaptive_events = restored.get("adaptive_events", [])
         logger.info(f"[恢复] 已恢复训练历史: {len(train_losses)} epochs, "
-                    f"best_val_loss={best_val_loss:.6f}, no_improve={no_improve_count}")
+                    f"best_val_loss={best_val_loss:.6f}, no_improve={no_improve_count}, "
+                    f"adaptive_events={len(adaptive_events)}")
 
     # 清除可能残留的暂停标志
     preserve_pause_flag = os.environ.get("ADAGEO_PRESERVE_PAUSE_FLAG", "0") == "1"
@@ -715,6 +751,52 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
     epochs = config["training"]["epochs"]
     patience = config["training"].get("patience", 15)
     use_early_stop = config["training"].get("use_early_stop", True)
+
+    # 监控指标（New Best / Early-Stop 统一）
+    monitor_metric = str(config["training"].get("monitor_metric", "MAE")).strip()
+    monitor_mode = str(config["training"].get("monitor_mode", "min")).strip().lower()
+    if monitor_mode not in ("min", "max"):
+        raise ValueError(f"Unsupported training.monitor_mode='{monitor_mode}', expected 'min' or 'max'.")
+
+    # C) 稳健早停：可选 EMA 平滑监控值
+    early_stop_use_ema = bool(config["training"].get("early_stop_use_ema", True))
+    early_stop_ema_alpha = float(config["training"].get("early_stop_ema_alpha", 0.3))
+    early_stop_min_delta = float(config["training"].get("early_stop_min_delta", 0.0))
+    early_stop_ema = None
+    best_monitor_value = float("inf") if monitor_mode == "min" else float("-inf")
+
+    # D) 动态K贴底反馈：当 k_mean 长时间贴近 min_keep 时，轻微上调 top_p
+    dynamic_k_feedback_enabled = bool(config["training"].get("dynamic_k_feedback_enabled", True))
+    dynamic_k_floor_patience = int(config["training"].get("dynamic_k_floor_patience", 3))
+    dynamic_k_floor_margin = float(config["training"].get("dynamic_k_floor_margin", 0.2))
+    dynamic_k_top_p_step = float(config["training"].get("dynamic_k_top_p_step", 0.01))
+    dynamic_k_top_p_max = float(config["training"].get("dynamic_k_top_p_max", 0.80))
+    dynamic_k_floor_count = 0
+
+    # 平台期自适应调参（不改模型结构）
+    adaptive_enabled = bool(config["training"].get("adaptive_tuning_enabled", False))
+    adaptive_patience = int(config["training"].get("adaptive_tuning_patience", 10))
+    adaptive_loss_type = str(config["training"].get("adaptive_tuning_loss_type", "l1")).strip().lower()
+    adaptive_lr_drop = float(config["training"].get("adaptive_tuning_lr_drop", 0.0005))
+    adaptive_lr_floor = 0.002
+    adaptive_applied = bool(adaptive_events)
+    if adaptive_enabled:
+        logger.info(
+            "[Adaptive] enabled=True, "
+            f"patience={adaptive_patience}, target_loss={adaptive_loss_type}, "
+            f"lr_drop={adaptive_lr_drop:.6f}, lr_floor={adaptive_lr_floor:.4f}, "
+            f"already_applied={adaptive_applied}"
+        )
+    logger.info(
+        "[EarlyStop] "
+        f"monitor_metric={monitor_metric}, mode={monitor_mode}, "
+        f"use_ema={early_stop_use_ema}, ema_alpha={early_stop_ema_alpha:.2f}, min_delta={early_stop_min_delta:.6f}"
+    )
+    logger.info(
+        "[DynamicK-Feedback] "
+        f"enabled={dynamic_k_feedback_enabled}, floor_patience={dynamic_k_floor_patience}, "
+        f"margin={dynamic_k_floor_margin:.2f}, top_p_step={dynamic_k_top_p_step:.3f}, top_p_max={dynamic_k_top_p_max:.2f}"
+    )
 
     # 显存预估
     if device.type == "cuda":
@@ -1009,29 +1091,108 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
                 val_metrics_history[key].append(val_metrics[key])
 
         # 学习率调度
-        current_lr = optimizer.param_groups[0]["lr"]
+        lr_before_step = float(optimizer.param_groups[0]["lr"])
         if scheduler:
             scheduler.step()
+        lr_after_step = float(optimizer.param_groups[0]["lr"])
 
         epoch_time = time.time() - epoch_start
 
-        # 判断是否为最佳
-        is_best = val_metrics["loss"] < best_val_loss
-        if is_best:
-            prev_best = best_val_loss
-            best_val_loss = val_metrics["loss"]
+        # 监控值：按 monitor_metric 统一 New Best / Early-Stop
+        val_loss = float(val_metrics["loss"])
+        if monitor_metric not in val_metrics:
+            raise ValueError(
+                f"training.monitor_metric='{monitor_metric}' not found in val metrics. "
+                f"Available keys: {list(val_metrics.keys())}"
+            )
+        metric_value = float(val_metrics[monitor_metric])
+
+        # C) 稳健早停监控值：EMA 或原始监控值
+        if early_stop_use_ema:
+            if early_stop_ema is None:
+                early_stop_ema = metric_value
+            else:
+                early_stop_ema = early_stop_ema_alpha * metric_value + (1.0 - early_stop_ema_alpha) * early_stop_ema
+            monitor_value = float(early_stop_ema)
+        else:
+            monitor_value = metric_value
+
+        if monitor_mode == "min":
+            monitor_improved = monitor_value < (best_monitor_value - early_stop_min_delta)
+        else:
+            monitor_improved = monitor_value > (best_monitor_value + early_stop_min_delta)
+
+        if monitor_improved:
+            prev_best_monitor = best_monitor_value
+            best_monitor_value = monitor_value
             no_improve_count = 0
-            if prev_best < float("inf"):
-                loss_delta = prev_best - val_metrics["loss"]
-                best_tag = f"{C.GREEN}{C.BOLD}New Best{C.RESET} ({C.GREEN}-{loss_delta:.6f}{C.RESET})"
-                best_tag_plain = f"New Best (-{loss_delta:.6f})"
+            is_best = True
+            if (monitor_mode == "min" and prev_best_monitor < float("inf")) or (monitor_mode == "max" and prev_best_monitor > float("-inf")):
+                if monitor_mode == "min":
+                    monitor_delta = prev_best_monitor - monitor_value
+                else:
+                    monitor_delta = monitor_value - prev_best_monitor
+                best_tag = f"{C.GREEN}{C.BOLD}New Best [{monitor_metric} -{monitor_delta:.4f}]{C.RESET}"
+                best_tag_plain = f"New Best [{monitor_metric} -{monitor_delta:.4f}]"
             else:
                 best_tag = f"{C.GREEN}{C.BOLD}New Best{C.RESET}"
                 best_tag_plain = "New Best"
         else:
+            is_best = False
             no_improve_count += 1
             best_tag = ""
             best_tag_plain = ""
+
+        # best_val_loss 仅作为历史展示，继续记录 val_loss 最优
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+
+        # 平台期触发一次自适应：降学习率 + 切换损失函数
+        adaptive_triggered = False
+        if adaptive_enabled and (not adaptive_applied) and no_improve_count >= adaptive_patience:
+            old_lr = float(optimizer.param_groups[0]["lr"])
+            new_lr = max(adaptive_lr_floor, old_lr - adaptive_lr_drop)
+            for pg in optimizer.param_groups:
+                pg["lr"] = new_lr
+
+            switched_loss_name = ""
+            if adaptive_loss_type in ("l1", "mae"):
+                criterion = nn.L1Loss()
+                switched_loss_name = "L1Loss"
+            elif adaptive_loss_type == "huber":
+                criterion = nn.HuberLoss(delta=config["training"].get("huber_delta", 1.0))
+                switched_loss_name = "HuberLoss"
+            elif adaptive_loss_type in ("mse", "l2"):
+                criterion = nn.MSELoss()
+                switched_loss_name = "MSELoss"
+            else:
+                raise ValueError(
+                    f"Unsupported training.adaptive_tuning_loss_type='{adaptive_loss_type}'. "
+                    "Supported: ['mae', 'l1', 'mse', 'l2', 'huber']."
+                )
+
+            adaptive_applied = True
+            adaptive_triggered = True
+            no_improve_count = 0
+            adaptive_event = {
+                "epoch": int(epoch),
+                "old_lr": float(old_lr),
+                "new_lr": float(new_lr),
+                "new_loss": str(switched_loss_name),
+                "trigger_no_improve": int(adaptive_patience),
+                "val_loss_at_trigger": float(val_metrics["loss"]),
+            }
+            adaptive_events.append(adaptive_event)
+            adaptive_msg_plain = (
+                "[Adaptive Applied] Plateau detected -> applied once: "
+                f"epoch={epoch}, loss={switched_loss_name}, lr {old_lr:.6f} -> {new_lr:.6f}"
+            )
+            logger.info(adaptive_msg_plain)
+            _log_file_only(adaptive_msg_plain)
+            tqdm_log(
+                f"    {C.YELLOW}{C.BOLD}⚠ Adaptive Applied{C.RESET} "
+                f"{C.YELLOW}loss={switched_loss_name}, lr {old_lr:.6f} -> {new_lr:.6f}{C.RESET}"
+            )
 
         # ---- 格式化终端输出 ----
         elapsed = time.time() - training_start_time
@@ -1051,13 +1212,17 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
             f"  {C.DIM}{epoch_time:.0f}s{C.RESET}"
             f"  {best_tag}"
         )
+        current_loss_name = criterion.__class__.__name__.replace("Loss", "").lower()
+        cosine_enabled = (sched_type == "cosine")
         metric_lines = [
             f"          {C.DIM}│{C.RESET}  MAE: {C.WHITE}{val_metrics['MAE']:.4f}{C.RESET}",
             f"          {C.DIM}│{C.RESET}  RMSE: {C.WHITE}{val_metrics['RMSE']:.4f}{C.RESET}",
             f"          {C.DIM}│{C.RESET}  sMAPE: {C.WHITE}{val_metrics.get('sMAPE', 0.0):.2f}%{C.RESET}",
             f"          {C.DIM}│{C.RESET}  WMAPE: {C.WHITE}{val_metrics.get('WMAPE', 0.0):.2f}%{C.RESET}",
             f"          {C.DIM}│{C.RESET}  MAPE(ref): {C.DIM}{val_metrics.get('MAPE', 0.0):.2f}%{C.RESET}",
-            f"          {C.DIM}│{C.RESET}  LR: {C.DIM}{current_lr:.1e}{C.RESET}",
+            f"          {C.DIM}│{C.RESET}  LR(step): {C.DIM}{lr_before_step:.1e} -> {lr_after_step:.1e}{C.RESET}",
+            f"          {C.DIM}│{C.RESET}  LossType: {C.WHITE}{current_loss_name}{C.RESET}",
+            f"          {C.DIM}│{C.RESET}  CosineLR: {C.WHITE}{'On' if cosine_enabled else 'Off'}{C.RESET}",
             f"          {C.DIM}│{C.RESET}  Time: {C.DIM}[{elapsed_str}<{eta_str}]{C.RESET}",
         ]
         if "VectorMAE" in val_metrics:
@@ -1067,7 +1232,34 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
 
         raw_model = getattr(model, "_orig_mod", model)
         pruning_stats = raw_model.get_last_pruning_stats() if hasattr(raw_model, "get_last_pruning_stats") else None
+        dynamic_k_feedback_msg = ""
         if pruning_stats is not None:
+            # D) 动态K贴底反馈：连续贴近 min_keep 时，轻微提升 top_p
+            if dynamic_k_feedback_enabled:
+                k_mean = float(pruning_stats.get("k_mean", 0.0))
+                k_floor = float(getattr(raw_model, "pruning_min_keep", 1)) + dynamic_k_floor_margin
+                if k_mean <= k_floor:
+                    dynamic_k_floor_count += 1
+                else:
+                    dynamic_k_floor_count = 0
+
+                spatial_module = getattr(raw_model, "spatial_module", None)
+                if dynamic_k_floor_count >= dynamic_k_floor_patience and spatial_module is not None and hasattr(spatial_module, "pruning_top_p"):
+                    old_top_p = float(spatial_module.pruning_top_p)
+                    new_top_p = min(dynamic_k_top_p_max, old_top_p + dynamic_k_top_p_step)
+                    if new_top_p > old_top_p + 1e-12:
+                        spatial_module.pruning_top_p = new_top_p
+                        dynamic_k_feedback_msg = f"top_p {old_top_p:.2f}->{new_top_p:.2f}"
+                        logger.info(
+                            "[DynamicK-Feedback] floor detected -> "
+                            f"k_mean={k_mean:.2f}, min_keep={getattr(spatial_module, 'pruning_min_keep', 1)}, "
+                            f"raise top_p {old_top_p:.2f} -> {new_top_p:.2f}"
+                        )
+                        _log_file_only(
+                            f"[DynamicK-Feedback] floor detected, raise top_p {old_top_p:.2f}->{new_top_p:.2f}"
+                        )
+                    dynamic_k_floor_count = 0
+
             mode_label = pruning_stats.get("mode", "fixed")
             p_cfg = pruning_stats.get("top_p", 0.0)
             t_cfg = pruning_stats.get("threshold", 0.0)
@@ -1091,6 +1283,17 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
             tqdm.write(mline)
         if line3 is not None:
             tqdm.write(line3)
+        if adaptive_triggered:
+            tqdm.write(
+                f"          {C.DIM}│{C.RESET}  {C.YELLOW}Adaptive Applied{C.RESET}: "
+                f"loss->{criterion.__class__.__name__}, "
+                f"lr->{optimizer.param_groups[0]['lr']:.6f}"
+            )
+        if dynamic_k_feedback_msg:
+            tqdm.write(
+                f"          {C.DIM}│{C.RESET}  {C.YELLOW}DynamicK Feedback{C.RESET}: "
+                f"{dynamic_k_feedback_msg}"
+            )
 
         # 文件日志 (无颜色, 紧凑一行, 不输出到终端)
         _log_file_only(
@@ -1104,7 +1307,9 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
             f"MAPE(ref): {val_metrics.get('MAPE', 0.0):.2f}% | "
             f"VecMAE: {val_metrics.get('VectorMAE', 0.0):.4f} | "
             f"VecRMSE: {val_metrics.get('VectorRMSE', 0.0):.4f} | "
-            f"LR: {current_lr:.2e} | "
+            f"LR(step): {lr_before_step:.2e}->{lr_after_step:.2e} | "
+            f"LossType: {current_loss_name} | "
+            f"CosineLR: {'On' if cosine_enabled else 'Off'} | "
             f"{epoch_time:.0f}s | "
             f"{best_tag_plain}"
         )
@@ -1115,6 +1320,7 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
             train_losses=train_losses, val_losses=val_losses,
             val_metrics_history=val_metrics_history,
             no_improve_count=no_improve_count, config=config,
+            adaptive_events=adaptive_events,
         )
 
         # 暂停检查 (来自 pause_resume/pause.py 的信号)

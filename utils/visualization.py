@@ -1,4 +1,4 @@
-﻿"""
+"""
 Visualization utilities.
 """
 
@@ -58,12 +58,24 @@ def plot_metrics_curve(
     save_path: str,
     title: str = "Validation Metrics",
 ):
-    fig, axes = plt.subplots(1, len(metrics_history), figsize=(5 * len(metrics_history), 5))
-    if len(metrics_history) == 1:
+    # 仅绘制有数据的指标，避免空序列触发 argmin 异常
+    valid_items = []
+    for metric_name, values in metrics_history.items():
+        if values is None or len(values) == 0:
+            logger.warning(f"[可视化] 跳过空指标序列: {metric_name}")
+            continue
+        valid_items.append((metric_name, values))
+
+    if len(valid_items) == 0:
+        logger.warning("[可视化] 无可绘制的指标序列，跳过 metrics 曲线绘制")
+        return
+
+    fig, axes = plt.subplots(1, len(valid_items), figsize=(5 * len(valid_items), 5))
+    if len(valid_items) == 1:
         axes = [axes]
 
     colors = ["#2196F3", "#FF5722", "#4CAF50", "#9C27B0"]
-    for idx, (metric_name, values) in enumerate(metrics_history.items()):
+    for idx, (metric_name, values) in enumerate(valid_items):
         ax = axes[idx]
         epochs = range(1, len(values) + 1)
         color = colors[idx % len(colors)]
@@ -74,7 +86,7 @@ def plot_metrics_curve(
         ax.set_title(metric_name, fontsize=12)
         ax.grid(True, alpha=0.3)
 
-        best_idx = np.argmin(values)
+        best_idx = int(np.argmin(values))
         ax.scatter(best_idx + 1, values[best_idx], color="red", s=50, zorder=5)
         ax.annotate(f"{values[best_idx]:.4f}", xy=(best_idx + 1, values[best_idx]), fontsize=9, color="red")
 

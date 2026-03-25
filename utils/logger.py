@@ -17,6 +17,8 @@ def setup_logger(
     level: int = logging.INFO,
     console: bool = True,
     log_file: bool = True,
+    log_file_path: str = None,
+    file_mode: str = "a",
 ) -> logging.Logger:
     """
     配置并返回 Logger。
@@ -54,15 +56,23 @@ def setup_logger(
         logger.addHandler(console_handler)
 
     # 文件 Handler
-    if log_file and log_dir is not None:
-        os.makedirs(log_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_path = os.path.join(log_dir, f"train_{timestamp}.log")
-        file_handler = logging.FileHandler(log_path, encoding="utf-8")
-        file_handler.setLevel(level)
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-        logger.info(f"日志文件: {log_path}")
+    if log_file:
+        if log_file_path is not None:
+            log_path = log_file_path
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        elif log_dir is not None:
+            os.makedirs(log_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_path = os.path.join(log_dir, f"train_{timestamp}.log")
+        else:
+            log_path = None
+
+        if log_path is not None:
+            file_handler = logging.FileHandler(log_path, mode=file_mode, encoding="utf-8")
+            file_handler.setLevel(level)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+            logger.info(f"日志文件: {log_path}")
 
     # 同时设置 root logger 的子模块
     for module_name in ["models", "utils"]:
