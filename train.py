@@ -326,6 +326,7 @@ def evaluate(
     criterion: nn.Module,
     device: torch.device,
     weather_scaler,
+    preprocessor,
     target_weather_dim: int,
     element_name: str,
     use_amp: bool = False,
@@ -373,7 +374,10 @@ def evaluate(
 
         pred_weather = pred_np[..., :target_weather_dim]
         true_weather = true_np[..., :target_weather_dim]
-        if weather_scaler is not None:
+        if preprocessor is not None and getattr(preprocessor, "fitted", False):
+            pred_weather = preprocessor.inverse_transform_weather(pred_weather)
+            true_weather = preprocessor.inverse_transform_weather(true_weather)
+        elif weather_scaler is not None:
             pred_weather = weather_scaler.inverse_transform(pred_weather)
             true_weather = weather_scaler.inverse_transform(true_weather)
 
@@ -585,6 +589,9 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
     logger.info("AdaGeoHyper-TKAN 训练启动")
     logger.info("=" * 60)
     logger.info(f"数据集: {dataset_name}")
+    metric_unit = "K" if str(dataset_name).strip().lower() == "temperature" else "physical"
+    if metric_unit == "K":
+        logger.info("[指标单位] Temperature metrics are reported in Kelvin (K) after inverse_transform")
     metric_plan = ELEMENT_METRIC_CONFIG.get(
         element_name,
         {"primary": ["MAE", "RMSE"], "secondary": ["sMAPE", "WMAPE"], "optional": ["MAPE"]},
@@ -661,6 +668,7 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
 
     train_loader = data["train_loader"]
     val_loader = data["val_loader"]
+    preprocessor = data.get("preprocessor")
     weather_scaler = data["weather_scaler"]
     positions = data["positions"]
     position_dim = data["position_dim"]
@@ -673,6 +681,7 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         station_indices=data["station_indices"],
         weather_scaler=data["weather_scaler"],
         context_scaler=data["context_scaler"],
+        preprocessor=data.get("preprocessor"),
         element_name=element_name,
         context_indices=data["context_indices"],
         context_feature_names=data["context_feature_names"],
@@ -1150,7 +1159,7 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         # 验证
         try:
             val_metrics = evaluate(
-                model, val_loader, criterion, device, weather_scaler, target_weather_dim,
+                model, val_loader, criterion, device, weather_scaler, preprocessor, target_weather_dim,
                 element_name=element_name,
                 use_amp=use_amp,
             )
@@ -1169,7 +1178,7 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
                     grad_scaler = torch.amp.GradScaler("cuda", enabled=True)
                 tqdm_log(f"    {C.YELLOW}⚠ 已自动关闭 compile，验证阶段改用 eager 重试{C.RESET}")
                 val_metrics = evaluate(
-                    model, val_loader, criterion, device, weather_scaler, target_weather_dim,
+                    model, val_loader, criterion, device, weather_scaler, preprocessor, target_weather_dim,
                     element_name=element_name,
                     use_amp=use_amp,
                 )

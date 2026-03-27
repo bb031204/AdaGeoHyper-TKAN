@@ -115,6 +115,111 @@ def build_scaler(scaler_type: str, data_2d: np.ndarray):
     raise ValueError(f"Unsupported scaler_type='{scaler_type}', supported: standard/minmax")
 
 
+class WeatherPreprocessor:
+    """Unified weather/context preprocessor aligned with hyper_kan behavior."""
+
+    def __init__(
+        self,
+        *,
+        kelvin_to_celsius: bool = False,
+        normalize: bool = True,
+        scaler_type: str = "standard",
+        context_scaler_type: str = "standard",
+        preprocessor: Optional[WeatherPreprocessor] = None,
+        fitted: bool = False,
+    ):
+        self.kelvin_to_celsius = bool(kelvin_to_celsius)
+        self.normalize = bool(normalize)
+        self.scaler_type = str(scaler_type).strip().lower()
+        self.context_scaler_type = str(context_scaler_type).strip().lower()
+        self.preprocessor = preprocessor
+        self.fitted = bool(fitted)
+
+    def fit(self, train_weather: np.ndarray, train_context: Optional[np.ndarray] = None):
+        weather = train_weather.astype(np.float64, copy=True)
+        if self.kelvin_to_celsius:
+            weather = weather - 273.15
+
+        if self.normalize:
+            self.weather_scaler = build_scaler(self.scaler_type, weather.reshape(-1, weather.shape[-1]))
+        else:
+            self.weather_scaler = None
+
+        if train_context is not None:
+            context = train_context.astype(np.float64, copy=True)
+            if self.normalize:
+                self.context_scaler = build_scaler(
+                    self.context_scaler_type,
+                    context.reshape(-1, context.shape[-1]),
+                )
+            else:
+                self.context_scaler = None
+
+        self.fitted = True
+        return self
+
+    def transform_weather(self, data):
+        x = data.copy() if isinstance(data, np.ndarray) else data.clone()
+        if self.kelvin_to_celsius:
+            x = x - 273.15
+        if self.normalize and self.weather_scaler is not None:
+            x = self.weather_scaler.transform(x)
+        return x
+
+    def inverse_transform_weather(self, data):
+        x = data.copy() if isinstance(data, np.ndarray) else data.clone()
+        if self.normalize and self.weather_scaler is not None:
+            x = self.weather_scaler.inverse_transform(x)
+        if self.kelvin_to_celsius:
+            x = x + 273.15
+        return x
+
+    def transform_context(self, data):
+        x = data.copy() if isinstance(data, np.ndarray) else data.clone()
+        if self.normalize and self.context_scaler is not None:
+            x = self.context_scaler.transform(x)
+        return x
+
+    def fit_transform(self, train_weather: np.ndarray, train_context: Optional[np.ndarray] = None):
+        self.fit(train_weather, train_context)
+        w = self.transform_weather(train_weather)
+        c = None if train_context is None else self.transform_context(train_context)
+        return w, c
+
+    def to_payload(self) -> Dict[str, Any]:
+        return {
+            "kelvin_to_celsius": self.kelvin_to_celsius,
+            "normalize": self.normalize,
+            "scaler_type": self.scaler_type,
+            "context_scaler_type": self.context_scaler_type,
+            "weather_scaler": _serialize_scaler(self.weather_scaler),
+            "context_scaler": _serialize_scaler(self.context_scaler),
+            "fitted": bool(self.fitted),
+        }
+
+    @staticmethod
+    def from_payload(payload: Dict[str, Any]) -> "WeatherPreprocessor":
+        return WeatherPreprocessor(
+            kelvin_to_celsius=payload.get("kelvin_to_celsius", False),
+            normalize=payload.get("normalize", True),
+            scaler_type=payload.get("scaler_type", "standard"),
+            context_scaler_type=payload.get("context_scaler_type", payload.get("scaler_type", "standard")),
+            weather_scaler=_deserialize_scaler(payload.get("weather_scaler")),
+            context_scaler=_deserialize_scaler(payload.get("context_scaler")),
+            fitted=payload.get("fitted", True),
+        )
+
+    def save(self, path: str):
+        with open(path, "wb") as f:
+            pickle.dump(self.to_payload(), f)
+
+    @staticmethod
+    def load(path: str) -> "WeatherPreprocessor":
+        with open(path, "rb") as f:
+            payload = pickle.load(f)
+        return WeatherPreprocessor.from_payload(payload)
+
+
 def resolve_context_indices(context_features: Optional[Dict[str, bool]]) -> Tuple[List[int], List[str]]:
     """
     Parse config flags to selected context channel indices.
@@ -208,6 +313,7 @@ def save_preprocessing_artifact(
     station_indices: Optional[np.ndarray],
     weather_scaler: Optional[object],
     context_scaler: Optional[object],
+    preprocessor: Optional[WeatherPreprocessor],
     element_name: str,
     context_indices: List[int],
     context_feature_names: List[str],
@@ -218,6 +324,7 @@ def save_preprocessing_artifact(
         "station_indices": None if station_indices is None else station_indices.astype(np.int64),
         "weather_scaler": _serialize_scaler(weather_scaler),
         "context_scaler": _serialize_scaler(context_scaler),
+        "preprocessor": None if preprocessor is None else preprocessor.to_payload(),
         "element_name": element_name,
         "context_indices": list(context_indices),
         "context_feature_names": list(context_feature_names),
@@ -238,6 +345,10 @@ def load_preprocessing_artifact(artifact_path: str) -> Dict[str, Any]:
     )
     payload["weather_scaler"] = _deserialize_scaler(payload.get("weather_scaler"))
     payload["context_scaler"] = _deserialize_scaler(payload.get("context_scaler"))
+    if payload.get("preprocessor") is not None:
+        payload["preprocessor"] = WeatherPreprocessor.from_payload(payload["preprocessor"])
+    else:
+        payload["preprocessor"] = None
     logger.info(f"[Data] Preprocessing artifact loaded: {artifact_path}")
     return payload
 
@@ -390,15 +501,10 @@ class WeatherDataset(Dataset):
                 context = context[idx]
             logger.info(f"[Data] Sample sampling: {total_samples} -> {n_samples} (ratio={sample_ratio})")
 
-        # temperature unit conversion before normalization
-        if self.element_settings.get("kelvin_to_celsius", False):
-            x[..., :weather_dim] = x[..., :weather_dim] - 273.15
-            y[..., :weather_dim] = y[..., :weather_dim] - 273.15
-
-        # weather normalization (global scaler, channel-wise stats)
-        if self.weather_scaler is not None and self.element_settings.get("normalize", True):
-            x[..., :weather_dim] = self.weather_scaler.transform(x[..., :weather_dim])
-            y[..., :weather_dim] = self.weather_scaler.transform(y[..., :weather_dim])
+        # unified weather preprocessing (hyper_kan aligned)
+        if self.preprocessor is not None:
+            x[..., :weather_dim] = self.preprocessor.transform_weather(x[..., :weather_dim])
+            y[..., :weather_dim] = self.preprocessor.transform_weather(y[..., :weather_dim])
 
         # context normalization + concat to x only (y keeps weather-only for loss)
         if context is not None and len(self.context_indices) > 0:
@@ -411,8 +517,8 @@ class WeatherDataset(Dataset):
             context_sel = context[..., self.context_indices]
             if self.context_calendar_encoding:
                 context_sel = _preprocess_context_calendar(context_sel, self.context_indices)
-            if self.context_scaler is not None:
-                context_sel = self.context_scaler.transform(context_sel)
+            if self.preprocessor is not None:
+                context_sel = self.preprocessor.transform_context(context_sel)
 
             x = np.concatenate([x, context_sel], axis=-1)
             logger.info(
@@ -526,6 +632,7 @@ def create_data_loaders(
     fixed_station_indices: Optional[np.ndarray] = None,
     weather_scaler_override: Optional[object] = None,
     context_scaler_override: Optional[object] = None,
+    preprocessor_override: Optional[WeatherPreprocessor] = None,
     robust_preprocess: Optional[Dict[str, Any]] = None,
 ) -> Dict:
     np.random.seed(seed)
@@ -569,30 +676,29 @@ def create_data_loaders(
 
     _validate_station_consistency(trn_raw, val_raw, test_raw, station_indices)
 
-    # fit weather scaler from training split only
+    # fit unified preprocessor from training split only (hyper_kan aligned)
     weather_for_fit = train_x[:, :, station_indices, :] if station_indices is not None else train_x
-    if element_settings.get("kelvin_to_celsius", False):
-        weather_for_fit = weather_for_fit - 273.15
-
-    weather_scaler = weather_scaler_override
-    if weather_scaler is None and element_settings.get("normalize", True):
-        weather_fit_2d = weather_for_fit.reshape(-1, target_weather_dim)
-        rp_enable = bool(rp_cfg.get("enabled", False))
-        if rp_enable:
-            low_q = float(rp_cfg.get("lower_q", 0.001))
-            high_q = float(rp_cfg.get("upper_q", 0.999))
-            if not (0.0 <= low_q < high_q <= 1.0):
-                raise ValueError(f"Invalid robust quantile range: lower_q={low_q}, upper_q={high_q}")
-            weather_fit_2d = _robust_clip_for_fit(weather_fit_2d, low_q, high_q)
-            logger.info(
-                f"[Data] Robust scaler-fit clipping enabled: lower_q={low_q:.4f}, upper_q={high_q:.4f}"
+    preprocessor = preprocessor_override
+    if preprocessor is None:
+        if weather_scaler_override is not None or context_scaler_override is not None:
+            preprocessor = WeatherPreprocessor(
+                kelvin_to_celsius=element_settings.get("kelvin_to_celsius", False),
+                normalize=element_settings.get("normalize", True),
+                scaler_type=element_settings.get("scaler_type", "standard"),
+                context_scaler_type=element_settings.get("context_scaler_type", "standard"),
+                weather_scaler=weather_scaler_override,
+                context_scaler=context_scaler_override,
+                fitted=True,
             )
-        weather_scaler = build_scaler(element_settings.get("scaler_type", "standard"), weather_fit_2d)
-    elif weather_scaler is not None:
-        logger.info("[Data] Reusing provided weather scaler (cross-run consistency)")
+        else:
+            preprocessor = WeatherPreprocessor(
+                kelvin_to_celsius=element_settings.get("kelvin_to_celsius", False),
+                normalize=element_settings.get("normalize", True),
+                scaler_type=element_settings.get("scaler_type", "standard"),
+                context_scaler_type=element_settings.get("context_scaler_type", "standard"),
+            )
 
-    # context scaler fit from training split only
-    context_scaler = context_scaler_override
+    context_fit_for_preproc = None
     selected_context_dim = 0
     if include_context and len(context_indices) > 0:
         if "context" not in trn_raw:
@@ -605,15 +711,35 @@ def create_data_loaders(
         context_sel_fit = context_fit[..., context_indices]
         if context_calendar_encoding:
             context_sel_fit = _preprocess_context_calendar(context_sel_fit, context_indices)
+        context_fit_for_preproc = context_sel_fit
         selected_context_dim = context_sel_fit.shape[-1]
-        if context_scaler is None:
-            context_fit_2d = context_sel_fit.reshape(-1, selected_context_dim)
-            context_scaler = build_scaler(
-                element_settings.get("context_scaler_type", "standard"),
-                context_fit_2d,
+
+    if not preprocessor.fitted:
+        rp_enable = bool(rp_cfg.get("enabled", False))
+        weather_fit = weather_for_fit
+        if rp_enable:
+            low_q = float(rp_cfg.get("lower_q", 0.001))
+            high_q = float(rp_cfg.get("upper_q", 0.999))
+            if not (0.0 <= low_q < high_q <= 1.0):
+                raise ValueError(f"Invalid robust quantile range: lower_q={low_q}, upper_q={high_q}")
+            weather_fit_2d = weather_fit.reshape(-1, target_weather_dim)
+            if preprocessor.kelvin_to_celsius:
+                weather_fit_2d = weather_fit_2d - 273.15
+            weather_fit_2d = _robust_clip_for_fit(weather_fit_2d, low_q, high_q)
+            weather_fit = weather_fit_2d.reshape(weather_fit.shape)
+            if preprocessor.kelvin_to_celsius:
+                weather_fit = weather_fit + 273.15
+            logger.info(
+                f"[Data] Robust scaler-fit clipping enabled: lower_q={low_q:.4f}, upper_q={high_q:.4f}"
             )
-        else:
-            logger.info("[Data] Reusing provided context scaler (cross-run consistency)")
+        preprocessor.fit(weather_fit, context_fit_for_preproc)
+    else:
+        logger.info("[Data] Reusing provided preprocessor (cross-run consistency)")
+
+    weather_scaler = preprocessor.weather_scaler
+    context_scaler = preprocessor.context_scaler
+
+    if include_context and len(context_indices) > 0:
         logger.info(
             f"[Data] Context enabled: {context_feature_names} (indices={context_indices}), "
             f"input channels {target_weather_dim} -> {target_weather_dim + selected_context_dim}"
@@ -639,8 +765,7 @@ def create_data_loaders(
     train_set = WeatherDataset(
         data_dir,
         mode="trn",
-        weather_scaler=weather_scaler,
-        context_scaler=context_scaler,
+        preprocessor=preprocessor,
         sample_ratio=sample_ratio,
         station_indices=station_indices,
         include_context=include_context,
@@ -651,8 +776,7 @@ def create_data_loaders(
     val_set = WeatherDataset(
         data_dir,
         mode="val",
-        weather_scaler=weather_scaler,
-        context_scaler=context_scaler,
+        preprocessor=preprocessor,
         sample_ratio=val_sample_ratio,
         station_indices=station_indices,
         include_context=include_context,
@@ -663,8 +787,7 @@ def create_data_loaders(
     test_set = WeatherDataset(
         data_dir,
         mode="test",
-        weather_scaler=weather_scaler,
-        context_scaler=context_scaler,
+        preprocessor=preprocessor,
         sample_ratio=test_sample_ratio,
         station_indices=station_indices,
         include_context=include_context,
@@ -699,6 +822,7 @@ def create_data_loaders(
         "val_loader": val_loader,
         "test_loader": test_loader,
         "scaler": weather_scaler,
+        "preprocessor": preprocessor,
         "weather_scaler": weather_scaler,
         "context_scaler": context_scaler,
         "positions": positions,

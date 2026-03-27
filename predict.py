@@ -178,6 +178,7 @@ def predict_on_test(
     test_loader,
     device: torch.device,
     weather_scaler,
+    preprocessor,
     target_weather_dim: int,
     use_amp: bool = False,
 ):
@@ -197,7 +198,10 @@ def predict_on_test(
         true_np = y.float().cpu().numpy()
         pred_weather = pred_np[..., :target_weather_dim]
         true_weather = true_np[..., :target_weather_dim]
-        if weather_scaler is not None:
+        if preprocessor is not None and getattr(preprocessor, "fitted", False):
+            pred_weather = preprocessor.inverse_transform_weather(pred_weather)
+            true_weather = preprocessor.inverse_transform_weather(true_weather)
+        elif weather_scaler is not None:
             pred_weather = weather_scaler.inverse_transform(pred_weather)
             true_weather = weather_scaler.inverse_transform(true_weather)
 
@@ -360,10 +364,12 @@ def predict(output_dir: str, config_path: str = None):
         fixed_station_indices=None if preproc_artifact is None else preproc_artifact["station_indices"],
         weather_scaler_override=None if preproc_artifact is None else preproc_artifact["weather_scaler"],
         context_scaler_override=None if preproc_artifact is None else preproc_artifact["context_scaler"],
+        preprocessor_override=None if preproc_artifact is None else preproc_artifact.get("preprocessor"),
         robust_preprocess=robust_preprocess_cfg,
     )
 
     test_loader = data["test_loader"]
+    preprocessor = data.get("preprocessor")
     weather_scaler = data["weather_scaler"]
     positions = data["positions"]
     position_dim = data["position_dim"]
@@ -392,7 +398,7 @@ def predict(output_dir: str, config_path: str = None):
         logger.info("[AMP] 混合精度推理已启用")
     logger.info("[预测] 开始测试集预测...")
     predictions, ground_truth = predict_on_test(
-        model, test_loader, device, weather_scaler, target_weather_dim, use_amp=use_amp
+        model, test_loader, device, weather_scaler, preprocessor, target_weather_dim, use_amp=use_amp
     )
     logger.info(f"[预测] 预测完成: pred={predictions.shape}, truth={ground_truth.shape}")
 
