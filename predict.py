@@ -101,6 +101,14 @@ def load_best_model(
 
     sub_kan_configs = model_cfg.get("tkan_sub_kan_configs", [None, 3])
 
+    scorer_mode = str(hyper_cfg.get("scorer_mode", "")).strip().lower()
+    if scorer_mode in ("dynamic", "adaptive", "temporal"):
+        use_state_summary_for_weights = True
+    elif scorer_mode in ("static", "geo", "geography"):
+        use_state_summary_for_weights = False
+    else:
+        use_state_summary_for_weights = bool(hyper_cfg.get("use_state_summary_for_weights", True))
+
     model = AdaGeoHyperTKAN(
         input_dim=input_feature_dim,
         output_dim=target_dim,
@@ -124,6 +132,7 @@ def load_best_model(
         pruning_top_p=hyper_cfg.get("dynamic_pruning", {}).get("top_p", 0.8),
         pruning_threshold=hyper_cfg.get("dynamic_pruning", {}).get("threshold", 0.05),
         pruning_min_keep=hyper_cfg.get("dynamic_pruning", {}).get("min_keep", 2),
+        use_state_summary_for_weights=use_state_summary_for_weights,
         fusion_dim=model_cfg["fusion_dim"],
         dropout=model_cfg["dropout"],
         pred_head_hidden=model_cfg["hidden_dim"] * 2,
@@ -143,9 +152,19 @@ def load_best_model(
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
     logger.info(f"[预测] 模型权重加载完成: {checkpoint_path}")
-    logger.info(
-        f"[预测] Checkpoint epoch: {checkpoint['epoch']}, val_loss: {checkpoint['best_val_loss']:.6f}"
-    )
+    best_val_mae = checkpoint.get("best_val_mae")
+    if best_val_mae is not None:
+        logger.info(
+            f"[预测] Checkpoint epoch: {checkpoint.get('epoch', 'N/A')}, best_val_mae: {float(best_val_mae):.6f}"
+        )
+    else:
+        best_val_loss = checkpoint.get("best_val_loss")
+        if best_val_loss is not None:
+            logger.info(
+                f"[预测] Checkpoint epoch: {checkpoint.get('epoch', 'N/A')}, best_val_loss(legacy): {float(best_val_loss):.6f}"
+            )
+        else:
+            logger.info(f"[预测] Checkpoint epoch: {checkpoint.get('epoch', 'N/A')}")
     model.eval()
     return model
 
@@ -305,22 +324,40 @@ def predict(output_dir: str, config_path: str = None):
             f"[Data] preprocessing artifact not found, fallback to fresh preprocessing: {preproc_artifact_path}"
         )
 
+    aggressive_cfg = config.get("aggressive_tuning", {})
+    data_cfg = config.get("data", {})
+
+    # 向后兼容：优先 aggressive_tuning；若缺失则回退旧字段，保证推理与旧实验口径一致
+    use_context_altitude = aggressive_cfg.get(
+        "use_context_altitude",
+        config.get("hypergraph", {}).get("use_context_altitude", True),
+    )
+    context_calendar_encoding = aggressive_cfg.get(
+        "context_calendar_encoding",
+        data_cfg.get("context_calendar_encoding", False),
+    )
+    robust_preprocess_cfg = aggressive_cfg.get(
+        "robust_preprocess",
+        data_cfg.get("robust_preprocess", {"enabled": False}),
+    )
+
     data = create_data_loaders(
         data_dir=data_dir,
         batch_size=config["training"]["batch_size"],
         num_stations=config["data"]["num_stations"],
-        sample_ratio=config["data"]["sample_ratio"],
+        sample_ratio=config["data"].get("sample_ratio", 1.0),
         val_sample_ratio=config["data"].get("val_sample_ratio", 1.0),
         test_sample_ratio=config["data"].get("test_sample_ratio", 1.0),
         seed=config["training"]["seed"],
         include_context=config["data"].get("include_context", False),
         context_features=config["data"].get("context_features", {}),
-        use_context_altitude=config["hypergraph"].get("use_context_altitude", True),
+        context_calendar_encoding=context_calendar_encoding,
+        use_context_altitude=use_context_altitude,
         element=element_name,
         fixed_station_indices=None if preproc_artifact is None else preproc_artifact["station_indices"],
         weather_scaler_override=None if preproc_artifact is None else preproc_artifact["weather_scaler"],
         context_scaler_override=None if preproc_artifact is None else preproc_artifact["context_scaler"],
-        robust_preprocess=config["data"].get("robust_preprocess", {}),
+        robust_preprocess=robust_preprocess_cfg,
     )
 
     test_loader = data["test_loader"]

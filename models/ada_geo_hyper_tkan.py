@@ -59,6 +59,7 @@ class AdaGeoHyperTKAN(nn.Module):
         pruning_top_p:      top-p 累积权重阈值
         pruning_threshold:  threshold 模式权重阈值
         pruning_min_keep:   每节点最少保留邻居数
+        use_state_summary_for_weights: 邻居权重打分是否引入时序状态摘要
         fusion_dim:         融合层维度 (需等于 hidden_dim)
         dropout:            Dropout 比率
         pred_head_hidden:   预测头 MLP 隐藏维度
@@ -90,6 +91,7 @@ class AdaGeoHyperTKAN(nn.Module):
         pruning_top_p: float = 0.8,
         pruning_threshold: float = 0.05,
         pruning_min_keep: int = 2,
+        use_state_summary_for_weights: bool = True,
         fusion_dim: int = 64,
         dropout: float = 0.1,
         pred_head_hidden: int = 128,
@@ -137,6 +139,7 @@ class AdaGeoHyperTKAN(nn.Module):
             pruning_top_p=pruning_top_p,
             pruning_threshold=pruning_threshold,
             pruning_min_keep=pruning_min_keep,
+            use_state_summary_for_weights=use_state_summary_for_weights,
         )
 
         # ===============================

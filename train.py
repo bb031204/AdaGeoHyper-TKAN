@@ -174,6 +174,14 @@ def build_model(config: dict, input_feature_dim: int, target_dim: int, position_
     sub_kan_configs = model_cfg.get("tkan_sub_kan_configs", [None, 3])
     # YAML 中 null 会被解析为 None, int 保持原样
 
+    scorer_mode = str(hyper_cfg.get("scorer_mode", "")).strip().lower()
+    if scorer_mode in ("dynamic", "adaptive", "temporal"):
+        use_state_summary_for_weights = True
+    elif scorer_mode in ("static", "geo", "geography"):
+        use_state_summary_for_weights = False
+    else:
+        use_state_summary_for_weights = bool(hyper_cfg.get("use_state_summary_for_weights", True))
+
     model = AdaGeoHyperTKAN(
         input_dim=input_feature_dim,
         output_dim=target_dim,
@@ -197,6 +205,7 @@ def build_model(config: dict, input_feature_dim: int, target_dim: int, position_
         pruning_top_p=hyper_cfg.get("dynamic_pruning", {}).get("top_p", 0.8),
         pruning_threshold=hyper_cfg.get("dynamic_pruning", {}).get("threshold", 0.05),
         pruning_min_keep=hyper_cfg.get("dynamic_pruning", {}).get("min_keep", 2),
+        use_state_summary_for_weights=use_state_summary_for_weights,
         fusion_dim=model_cfg["fusion_dim"],
         dropout=model_cfg["dropout"],
         pred_head_hidden=model_cfg["hidden_dim"] * 2,
@@ -235,6 +244,8 @@ def train_one_epoch(
     total_loss = 0.0
     num_batches = 0
     grad_clip = config["training"].get("grad_clip", 0)
+    accum_steps = int(config["training"].get("gradient_accumulation_steps", 1))
+    accum_steps = max(1, accum_steps)
 
     pbar = tqdm(
         train_loader,
@@ -244,29 +255,38 @@ def train_one_epoch(
         bar_format="{l_bar}{bar:35}{r_bar}",
     )
 
+    optimizer.zero_grad(set_to_none=True)
+
     for batch_idx, (x, y) in enumerate(pbar):
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
-
-        optimizer.zero_grad(set_to_none=True)
 
         try:
             with torch.amp.autocast("cuda", enabled=use_amp):
                 pred = model(x)
                 loss = criterion(pred, y)
 
+            loss_for_backward = loss / accum_steps
+
             if use_amp and grad_scaler is not None:
-                grad_scaler.scale(loss).backward()
-                if grad_clip > 0:
-                    grad_scaler.unscale_(optimizer)
-                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                grad_scaler.step(optimizer)
-                grad_scaler.update()
+                grad_scaler.scale(loss_for_backward).backward()
             else:
-                loss.backward()
+                loss_for_backward.backward()
+
+            should_step = ((batch_idx + 1) % accum_steps == 0) or ((batch_idx + 1) == len(train_loader))
+            if should_step:
                 if grad_clip > 0:
+                    if use_amp and grad_scaler is not None:
+                        grad_scaler.unscale_(optimizer)
                     nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                optimizer.step()
+
+                if use_amp and grad_scaler is not None:
+                    grad_scaler.step(optimizer)
+                    grad_scaler.update()
+                else:
+                    optimizer.step()
+
+                optimizer.zero_grad(set_to_none=True)
 
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
@@ -373,7 +393,7 @@ def save_checkpoint(
     optimizer,
     scheduler,
     epoch: int,
-    best_val_loss: float,
+    best_val_mae: float,
     output_dir: str,
     is_best: bool = False,
     train_losses: list = None,
@@ -391,7 +411,7 @@ def save_checkpoint(
         "model_state_dict": raw_model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
-        "best_val_loss": best_val_loss,
+        "best_val_mae": best_val_mae,
         # 训练历史 (用于暂停恢复)
         "train_losses": train_losses or [],
         "val_losses": val_losses or [],
@@ -409,7 +429,7 @@ def save_checkpoint(
     if is_best:
         best_path = os.path.join(output_dir, "checkpoints", "best_model.pth")
         torch.save(checkpoint, best_path)
-        _log_file_only(f"[保存] 最佳模型已保存 (epoch {epoch}, val_loss={best_val_loss:.6f})")
+        _log_file_only(f"[保存] 最佳模型已保存 (epoch {epoch}, MAE={best_val_mae:.6f})")
 
 
 def load_checkpoint(
@@ -423,7 +443,7 @@ def load_checkpoint(
     加载 checkpoint, 返回恢复信息字典。
 
     Returns:
-        dict: 包含 epoch, best_val_loss, train_losses, val_losses,
+        dict: 包含 epoch, best_val_mae, train_losses, val_losses,
               val_metrics_history, no_improve_count
     """
     logger.info(f"[恢复] 从 checkpoint 恢复: {checkpoint_path}")
@@ -437,12 +457,15 @@ def load_checkpoint(
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
     epoch = checkpoint["epoch"]
-    best_val_loss = checkpoint["best_val_loss"]
-    logger.info(f"[恢复] 恢复完成: epoch={epoch}, best_val_loss={best_val_loss:.6f}")
+    best_val_mae = checkpoint.get("best_val_mae")
+    if best_val_mae is None:
+        # 向后兼容旧 checkpoint
+        best_val_mae = checkpoint.get("best_val_loss", float("inf"))
+    logger.info(f"[恢复] 恢复完成: epoch={epoch}, best_val_mae={best_val_mae:.6f}")
 
     return {
         "epoch": epoch,
-        "best_val_loss": best_val_loss,
+        "best_val_mae": best_val_mae,
         "train_losses": checkpoint.get("train_losses", []),
         "val_losses": checkpoint.get("val_losses", []),
         "val_metrics_history": checkpoint.get(
@@ -579,6 +602,23 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
     data_dir = os.path.join(config["data"]["data_root"], dataset_name)
     logger.info(f"[数据] 数据目录: {data_dir}")
 
+    aggressive_cfg = config.get("aggressive_tuning", {})
+    data_cfg = config.get("data", {})
+
+    # 向后兼容：优先 aggressive_tuning；若缺失则回退旧字段，保证 resume 数据口径连续
+    use_context_altitude = aggressive_cfg.get(
+        "use_context_altitude",
+        config.get("hypergraph", {}).get("use_context_altitude", True),
+    )
+    context_calendar_encoding = aggressive_cfg.get(
+        "context_calendar_encoding",
+        data_cfg.get("context_calendar_encoding", False),
+    )
+    robust_preprocess_cfg = aggressive_cfg.get(
+        "robust_preprocess",
+        data_cfg.get("robust_preprocess", {"enabled": False}),
+    )
+
     data = create_data_loaders(
         data_dir=data_dir,
         batch_size=config["training"]["batch_size"],
@@ -589,9 +629,10 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         seed=config["training"]["seed"],
         include_context=config["data"].get("include_context", False),
         context_features=config["data"].get("context_features", {}),
-        use_context_altitude=config["hypergraph"].get("use_context_altitude", True),
+        context_calendar_encoding=context_calendar_encoding,
+        use_context_altitude=use_context_altitude,
         element=element_name,
-        robust_preprocess=config["data"].get("robust_preprocess", {}),
+        robust_preprocess=robust_preprocess_cfg,
     )
 
     train_loader = data["train_loader"]
@@ -713,7 +754,7 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
 
     # ---- 12. 恢复训练 ----
     start_epoch = 1
-    best_val_loss = float("inf")
+    best_val_mae = float("inf")
     no_improve_count = 0
     train_losses = []
     val_losses = []
@@ -722,22 +763,24 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         "VectorMAE": [], "VectorRMSE": [],
     }
     adaptive_events = []
+    resumed_training = False
 
     # 优先使用 pause_resume 传入的 checkpoint, 其次使用 config 中的
     resume_path = resume_checkpoint or config["output"].get("resume_from_checkpoint")
     if resume_path and os.path.exists(resume_path):
+        resumed_training = True
         restored = load_checkpoint(
             model, optimizer, scheduler, resume_path, device
         )
         start_epoch = restored["epoch"] + 1  # 从下一个 epoch 开始
-        best_val_loss = restored["best_val_loss"]
+        best_val_mae = restored["best_val_mae"]
         train_losses = restored["train_losses"]
         val_losses = restored["val_losses"]
         val_metrics_history = restored["val_metrics_history"]
         no_improve_count = restored["no_improve_count"]
         adaptive_events = restored.get("adaptive_events", [])
         logger.info(f"[恢复] 已恢复训练历史: {len(train_losses)} epochs, "
-                    f"best_val_loss={best_val_loss:.6f}, no_improve={no_improve_count}, "
+                    f"best_val_mae={best_val_mae:.6f}, no_improve={no_improve_count}, "
                     f"adaptive_events={len(adaptive_events)}")
 
     # 清除可能残留的暂停标志
@@ -765,8 +808,30 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
     early_stop_ema = None
     best_monitor_value = float("inf") if monitor_mode == "min" else float("-inf")
 
-    # D) 动态K贴底反馈：当 k_mean 长时间贴近 min_keep 时，轻微上调 top_p
-    dynamic_k_feedback_enabled = bool(config["training"].get("dynamic_k_feedback_enabled", True))
+    # Resume 兼容：从历史重建监控器状态，避免恢复后首轮被误判为 New Best
+    metric_hist = val_metrics_history.get(monitor_metric, []) if isinstance(val_metrics_history, dict) else []
+    if metric_hist:
+        if early_stop_use_ema:
+            ema = None
+            for v in metric_hist:
+                fv = float(v)
+                ema = fv if ema is None else (early_stop_ema_alpha * fv + (1.0 - early_stop_ema_alpha) * ema)
+            early_stop_ema = ema
+            best_monitor_value = float(ema)
+        else:
+            if monitor_mode == "min":
+                best_monitor_value = float(min(metric_hist))
+            else:
+                best_monitor_value = float(max(metric_hist))
+
+    # D) 动态K贴底反馈：仅在动态裁剪开启时才有意义（与 dynamic_pruning 联动）
+    pruning_cfg = config.get("hypergraph", {}).get("dynamic_pruning", {})
+    dynamic_pruning_enabled = bool(pruning_cfg.get("enabled", False))
+    dynamic_k_feedback_requested = bool(config["training"].get("dynamic_k_feedback_enabled", True))
+    dynamic_k_feedback_enabled = dynamic_pruning_enabled and dynamic_k_feedback_requested
+    if dynamic_k_feedback_requested and not dynamic_pruning_enabled:
+        logger.info("[DynamicK-Feedback] auto-disabled because hypergraph.dynamic_pruning.enabled=False")
+
     dynamic_k_floor_patience = int(config["training"].get("dynamic_k_floor_patience", 3))
     dynamic_k_floor_margin = float(config["training"].get("dynamic_k_floor_margin", 0.2))
     dynamic_k_top_p_step = float(config["training"].get("dynamic_k_top_p_step", 0.01))
@@ -787,10 +852,13 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
             f"lr_drop={adaptive_lr_drop:.6f}, lr_floor={adaptive_lr_floor:.4f}, "
             f"already_applied={adaptive_applied}"
         )
+    resume_best_guard_value = best_monitor_value if resumed_training else None
+
     logger.info(
         "[EarlyStop] "
         f"monitor_metric={monitor_metric}, mode={monitor_mode}, "
-        f"use_ema={early_stop_use_ema}, ema_alpha={early_stop_ema_alpha:.2f}, min_delta={early_stop_min_delta:.6f}"
+        f"use_ema={early_stop_use_ema}, ema_alpha={early_stop_ema_alpha:.2f}, min_delta={early_stop_min_delta:.6f}, "
+        f"best_monitor_init={best_monitor_value:.6f}"
     )
     logger.info(
         "[DynamicK-Feedback] "
@@ -1126,7 +1194,16 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
             prev_best_monitor = best_monitor_value
             best_monitor_value = monitor_value
             no_improve_count = 0
-            is_best = True
+
+            # 恢复训练保护：只有真正超过恢复前历史最佳才允许覆盖 best_model.pth
+            if resume_best_guard_value is not None:
+                if monitor_mode == "min":
+                    is_best = monitor_value < (resume_best_guard_value - early_stop_min_delta)
+                else:
+                    is_best = monitor_value > (resume_best_guard_value + early_stop_min_delta)
+            else:
+                is_best = True
+
             if (monitor_mode == "min" and prev_best_monitor < float("inf")) or (monitor_mode == "max" and prev_best_monitor > float("-inf")):
                 if monitor_mode == "min":
                     monitor_delta = prev_best_monitor - monitor_value
@@ -1143,9 +1220,9 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
             best_tag = ""
             best_tag_plain = ""
 
-        # best_val_loss 仅作为历史展示，继续记录 val_loss 最优
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # best_val_mae 作为唯一基准：严格用 MAE 记录最优
+        if "MAE" in val_metrics and float(val_metrics["MAE"]) < best_val_mae:
+            best_val_mae = float(val_metrics["MAE"])
 
         # 平台期触发一次自适应：降学习率 + 切换损失函数
         adaptive_triggered = False
@@ -1316,7 +1393,7 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
 
         # 保存 checkpoint (含完整训练历史)
         save_checkpoint(
-            model, optimizer, scheduler, epoch, best_val_loss, output_dir, is_best,
+            model, optimizer, scheduler, epoch, best_val_mae, output_dir, is_best,
             train_losses=train_losses, val_losses=val_losses,
             val_metrics_history=val_metrics_history,
             no_improve_count=no_improve_count, config=config,
@@ -1334,7 +1411,7 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
             tqdm.write(f"    {C.CYAN}恢复训练: python pause_resume/resume.py{C.RESET}")
             tqdm.write(f"  {C.YELLOW}{'━' * W}{C.RESET}")
             _log_file_only(f"[暂停] 在 epoch {epoch} 安全暂停, checkpoint 已保存")
-            return output_dir, best_val_loss
+            return output_dir, best_val_mae
 
         # 早停检查
         if use_early_stop and no_improve_count >= patience:
@@ -1350,11 +1427,11 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
     tqdm.write(f"\n  {C.GREEN}{'━' * W}{C.RESET}")
     tqdm.write(f"  {C.GREEN}{C.BOLD}{'TRAINING COMPLETE':^{W}}{C.RESET}")
     tqdm.write(f"  {C.GREEN}{'─' * W}{C.RESET}")
-    tqdm.write(f"    Best Val Loss: {C.GREEN}{C.BOLD}{best_val_loss:.6f}{C.RESET}"
+    tqdm.write(f"    Best MAE: {C.GREEN}{C.BOLD}{best_val_mae:.6f}{C.RESET}"
                f"    Total Time: {C.CYAN}{total_time_str}{C.RESET}"
                f"    Epochs: {C.WHITE}{epoch}/{epochs}{C.RESET}")
     tqdm.write(f"  {C.GREEN}{'━' * W}{C.RESET}")
-    _log_file_only(f"训练完成! 最佳 Val Loss: {best_val_loss:.6f}, 总耗时: {total_time_str}")
+    _log_file_only(f"训练完成! 最佳 MAE: {best_val_mae:.6f}, 总耗时: {total_time_str}")
 
     # ---- 15. 可视化 ----
     fig_dir = os.path.join(output_dir, "figures")
@@ -1376,7 +1453,7 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         "train_losses": train_losses,
         "val_losses": val_losses,
         "val_metrics": val_metrics_history,
-        "best_val_loss": best_val_loss,
+        "best_val_mae": best_val_mae,
         "total_epochs": epoch,
         "config": config,
     }
@@ -1386,7 +1463,7 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         "train_losses": train_losses,
         "val_losses": val_losses,
         "val_metrics": val_metrics_history,
-        "best_val_loss": best_val_loss,
+        "best_val_mae": best_val_mae,
         "total_epochs": epoch,
         "dataset_name": dataset_name,
     }
@@ -1394,7 +1471,7 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         json.dump(history_serializable, f, indent=2)
     logger.info(f"[保存] 训练历史已保存: {history_path}")
 
-    return output_dir, best_val_loss
+    return output_dir, best_val_mae
 
 
 if __name__ == "__main__":

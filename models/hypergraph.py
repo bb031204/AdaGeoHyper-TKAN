@@ -180,13 +180,15 @@ class AdaptiveScorer(nn.Module):
 
     Args:
         position_dim: 位置特征维度 (2 或 3)
-        summary_dim:  状态摘要维度
+        summary_dim:  状态摘要维度（可为0，表示不引入时序摘要）
         hidden_dim:   MLP 隐藏维度
     """
 
     def __init__(self, position_dim: int, summary_dim: int, hidden_dim: int = 32):
         super().__init__()
-        input_dim = position_dim * 2 + summary_dim * 2  # [p_i, p_j, s_i, s_j]
+        self.position_dim = int(position_dim)
+        self.summary_dim = int(summary_dim)
+        input_dim = self.position_dim * 2 + self.summary_dim * 2  # [p_i, p_j, s_i, s_j]
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(inplace=True),
@@ -197,8 +199,8 @@ class AdaptiveScorer(nn.Module):
         self,
         p_center: torch.Tensor,
         p_neighbor: torch.Tensor,
-        s_center: torch.Tensor,
-        s_neighbor: torch.Tensor,
+        s_center: Optional[torch.Tensor],
+        s_neighbor: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """
         Args:
@@ -210,7 +212,12 @@ class AdaptiveScorer(nn.Module):
         Returns:
             scores: [B, N, K+1] 打分
         """
-        combined = torch.cat([p_center, p_neighbor, s_center, s_neighbor], dim=-1)
+        if self.summary_dim <= 0:
+            combined = torch.cat([p_center, p_neighbor], dim=-1)
+        else:
+            if s_center is None or s_neighbor is None:
+                raise ValueError("AdaptiveScorer expects summary tensors when summary_dim > 0")
+            combined = torch.cat([p_center, p_neighbor, s_center, s_neighbor], dim=-1)
         # combined: [B, N, K+1, input_dim]
         scores = self.mlp(combined).squeeze(-1)
         # scores: [B, N, K+1]
@@ -261,6 +268,7 @@ class AdaptiveGeoHypergraph(nn.Module):
         pruning_top_p: float = 0.8,
         pruning_threshold: float = 0.05,
         pruning_min_keep: int = 2,
+        use_state_summary_for_weights: bool = True,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -273,6 +281,7 @@ class AdaptiveGeoHypergraph(nn.Module):
         self.float32_norm = float32_norm
         self.summary_pool = summary_pool
         self.num_layers = num_layers
+        self.use_state_summary_for_weights = bool(use_state_summary_for_weights)
 
         # ---- 动态稀疏化配置 (方案3) ----
         self.dynamic_pruning = dynamic_pruning
@@ -282,15 +291,18 @@ class AdaptiveGeoHypergraph(nn.Module):
         self.pruning_min_keep = int(max(1, pruning_min_keep))
         self._last_pruning_stats = None
 
-        # ---- 状态摘要 ----
-        summary_dim = hidden_dim
-        if summary_pool == "linear":
-            self.summary_proj = nn.Sequential(
-                nn.Linear(input_dim, summary_dim),
-                nn.ReLU(inplace=True),
-            )
+        # ---- 状态摘要（可选） ----
+        summary_dim = hidden_dim if self.use_state_summary_for_weights else 0
+        if self.use_state_summary_for_weights:
+            if summary_pool == "linear":
+                self.summary_proj = nn.Sequential(
+                    nn.Linear(input_dim, summary_dim),
+                    nn.ReLU(inplace=True),
+                )
+            else:
+                self.summary_proj = nn.Linear(input_dim, summary_dim)
         else:
-            self.summary_proj = nn.Linear(input_dim, summary_dim)
+            self.summary_proj = None
 
         # ---- 自适应打分函数 ----
         self.scorer = AdaptiveScorer(
@@ -314,6 +326,10 @@ class AdaptiveGeoHypergraph(nn.Module):
         # 在 build_graph 时注册
         self.register_buffer("neighbor_indices", None)
         self.register_buffer("positions_tensor", None)
+        self.register_buffer("H_static", None)
+        self.register_buffer("W_e_static", None)
+        self.register_buffer("D_e_static", None)
+        self.register_buffer("D_v_static", None)
 
         self._graph_built = False
 
@@ -422,21 +438,43 @@ class AdaptiveGeoHypergraph(nn.Module):
                 logger.info(f"[超图]   文件: {os.path.basename(cache_path)}")
                 logger.info(f"[超图]   构建维度: {actual_pos_dim}D ({dim_tag}) -> {dim_desc}")
 
-        # ---- 注册为 buffer ----
-        self.neighbor_indices = torch.from_numpy(neighbor_indices).long()
+        # ---- 注册为 buffer（显式超图表示） ----
+        self.neighbor_indices = torch.from_numpy(neighbor_indices).long()          # [N, K+1]
+        self.positions_tensor = torch.from_numpy(positions).float()                # [N, P]
 
-        self.positions_tensor = torch.from_numpy(positions).float()
+        # incidence matrix H: [N, E]，每个中心节点 i 对应一条超边 e_i
+        E = N
+        H_static = torch.zeros((N, E), dtype=torch.float32)
+        edge_members = self.neighbor_indices.T.contiguous()  # [K+1, E]
+        edge_ids = torch.arange(E, dtype=torch.long).unsqueeze(0).expand_as(edge_members)
+        H_static[edge_members, edge_ids] = 1.0
+
+        # 静态超边权重（默认 1），动态机制在前向中以边内贡献权重体现
+        W_e_static = torch.ones((E,), dtype=torch.float32)
+
+        # 预计算静态度（用于兼容/诊断，前向仍会基于动态权重重算）
+        D_e_static = H_static.sum(dim=0).clamp_min(self.degree_clamp_min)
+        D_v_static = H_static.sum(dim=1).clamp_min(self.degree_clamp_min)
+
+        self.H_static = H_static
+        self.W_e_static = W_e_static
+        self.D_e_static = D_e_static
+        self.D_v_static = D_v_static
 
         try:
             device = next(self.parameters()).device
             self.neighbor_indices = self.neighbor_indices.to(device)
             self.positions_tensor = self.positions_tensor.to(device)
+            self.H_static = self.H_static.to(device)
+            self.W_e_static = self.W_e_static.to(device)
+            self.D_e_static = self.D_e_static.to(device)
+            self.D_v_static = self.D_v_static.to(device)
         except StopIteration:
             pass
 
         self._graph_built = True
         logger.info(f"[超图] ========== 超图就绪 ==========")
-        logger.info(f"[超图] N={N}, K={k}, edges={N}, dim={actual_pos_dim}D ({dim_desc})")
+        logger.info(f"[超图] N={N}, K={k}, edges={E}, dim={actual_pos_dim}D ({dim_desc})")
 
     def _compute_state_summary(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -536,8 +574,11 @@ class AdaptiveGeoHypergraph(nn.Module):
         K_plus_1 = self.neighbor_indices.shape[1]  # K+1
         device = x.device
 
-        # 状态摘要
-        summary = self._compute_state_summary(x)  # [B, N, D_summary]
+        # 状态摘要（可选）
+        if self.use_state_summary_for_weights:
+            summary = self._compute_state_summary(x)  # [B, N, D_summary]
+        else:
+            summary = None
 
         # 位置信息
         positions = self.positions_tensor.to(device)  # [N, P]
@@ -553,14 +594,18 @@ class AdaptiveGeoHypergraph(nn.Module):
         p_neighbor = positions[nbr_idx]
         # p_neighbor: [N, K+1, P]
 
-        # 中心节点摘要 (广播)
-        s_center = summary.unsqueeze(2).expand(-1, -1, K_plus_1, -1)
-        # s_center: [B, N, K+1, D_s]
+        if self.use_state_summary_for_weights:
+            # 中心节点摘要 (广播)
+            s_center = summary.unsqueeze(2).expand(-1, -1, K_plus_1, -1)
+            # s_center: [B, N, K+1, D_s]
 
-        # 邻居节点摘要
-        s_neighbor = summary[:, nbr_idx, :]
-        # 索引: summary [B, N, D_s], nbr_idx [N, K+1]
-        # 结果: [B, N, K+1, D_s]
+            # 邻居节点摘要
+            s_neighbor = summary[:, nbr_idx, :]
+            # 索引: summary [B, N, D_s], nbr_idx [N, K+1]
+            # 结果: [B, N, K+1, D_s]
+        else:
+            s_center = None
+            s_neighbor = None
 
         # 扩展位置维度以匹配 batch
         p_center = p_center.unsqueeze(0).expand(B, -1, -1, -1)
@@ -573,12 +618,17 @@ class AdaptiveGeoHypergraph(nn.Module):
             scores = self.scorer(
                 p_center.float(),
                 p_neighbor.float(),
-                s_center.float(),
-                s_neighbor.float(),
+                s_center.float() if s_center is not None else None,
+                s_neighbor.float() if s_neighbor is not None else None,
             )
             weights = F.softmax(scores.float(), dim=-1)
         else:
-            scores = self.scorer(p_center, p_neighbor, s_center, s_neighbor)
+            scores = self.scorer(
+                p_center,
+                p_neighbor,
+                s_center,
+                s_neighbor,
+            )
             weights = F.softmax(scores, dim=-1)
 
         # 动态稀疏化: 在权重归一化后进行掩码裁剪，再二次归一化
@@ -612,7 +662,7 @@ class AdaptiveGeoHypergraph(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        超图空间传播前向传播。
+        超图空间传播前向传播（标准 HGNN 风格）。
 
         Args:
             x: [B, T, N, F] 输入时空特征
@@ -628,29 +678,58 @@ class AdaptiveGeoHypergraph(nn.Module):
         nbr_idx = self.neighbor_indices.to(device)  # [N, K+1]
 
         # ---- 计算自适应权重 ----
-        weights = self._compute_adaptive_weights(x)
-        # weights: [B, N, K+1]
+        weights = self._compute_adaptive_weights(x)  # [B, N, K+1]
 
-        # ---- 多层超图卷积 ----
-        # 将时间步展开: [B*T, N, F_in]
-        h = x.reshape(B * T, N, F_in)
+        # ---- 标准 HGNN 传播 ----
+        # H 是固定超边-节点骨架（每个中心节点一条超边）
+        # 动态机制通过边内节点贡献权重 weights 融入
+        h = x.reshape(B * T, N, F_in)  # [B*T, N, F]
 
-        # 预计算循环外常量 (避免重复 reshape/expand)
-        nbr_idx_flat = nbr_idx.reshape(-1)
-        w_bt = weights.unsqueeze(1).expand(-1, T, -1, -1).reshape(B * T, N, K_plus_1, 1)
+        # 预计算平铺维度
+        nbr_idx_flat = nbr_idx.reshape(-1)  # [N*(K+1)]
+        w_bt = weights.unsqueeze(1).expand(-1, T, -1, -1).reshape(B * T, N, K_plus_1)  # [B*T, N, K+1]
+
+        # 预计算“节点属于哪些超边”的索引（基于 H_static）
+        # H_static: [N, E], N==E
+        h_static = self.H_static.to(device)  # [N, E]
+        node_edge_mask = (h_static > 0).to(w_bt.dtype)  # [N, E]
 
         for layer_idx in range(self.num_layers):
-            nbr_features = h[:, nbr_idx_flat, :].reshape(B * T, N, K_plus_1, -1)
-            aggregated = (nbr_features * w_bt).sum(dim=2)
-            h = self.conv_layers[layer_idx](aggregated)
+            # 1) 节点度 D_v：节点参与所有超边的贡献总和（动态权重）
+            #    d_v[i] = sum_e H[i,e] * w_e(i)
+            #    这里用 node_edge_mask 统计成员关系，结合 w_bt 的节点贡献
+            #    将 w_bt 累加到节点所属的所有超边上
+            node_weight = w_bt.sum(dim=-1)  # [B*T, N]
+            d_v = (node_edge_mask * node_weight.unsqueeze(-1)).sum(dim=-1).clamp_min(self.degree_clamp_min)  # [B*T, N]
+            d_v_inv_sqrt = d_v.pow(-0.5)
+
+            h_norm = h * d_v_inv_sqrt.unsqueeze(-1)  # [B*T, N, F]
+
+            # 2) 节点 -> 超边：H^T D_v^{-1/2} X
+            nbr_features = h_norm[:, nbr_idx_flat, :].reshape(B * T, N, K_plus_1, -1)
+            edge_feat = (nbr_features * w_bt.unsqueeze(-1)).sum(dim=2)  # [B*T, E=N, F]
+
+            # 3) 超边度 D_e：每条超边内成员权重之和
+            d_e = w_bt.sum(dim=-1).clamp_min(self.degree_clamp_min)  # [B*T, E]
+            d_e_inv = d_e.pow(-1.0)
+            edge_feat = edge_feat * d_e_inv.unsqueeze(-1)
+
+            # 4) 超边 -> 节点：按节点的“超边隶属关系”聚合
+            #    使用 H_static 反向聚合，而非仅依赖邻域索引近似
+            edge_feat_exp = edge_feat.unsqueeze(1).expand(-1, N, -1, -1)  # [B*T, N, E, F]
+            node_edge = node_edge_mask.unsqueeze(0)  # [1, N, E]
+            node_agg = (edge_feat_exp * node_edge.unsqueeze(-1)).sum(dim=2)  # [B*T, N, F]
+
+            # 5) 再次 D_v^{-1/2}
+            node_agg = node_agg * d_v_inv_sqrt.unsqueeze(-1)
+
+            # 6) 线性映射 + 归一化
+            h = self.conv_layers[layer_idx](node_agg)
             h = self.layer_norms[layer_idx](h)
             h = self.activation(h)
             h = self.dropout_layer(h)
 
-        # 恢复时间维度
         H_s = h.reshape(B, T, N, self.hidden_dim)
-        # H_s: [B, T, N, D]
-
         return H_s
 
     def extra_repr(self) -> str:

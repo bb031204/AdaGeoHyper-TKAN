@@ -140,8 +140,10 @@ def print_checkpoint_info(checkpoint_path: str):
     print(f"  文件: {checkpoint_path}")
     print(f"  Epoch: {checkpoint.get('epoch', 'Unknown')}")
 
-    if "best_val_loss" in checkpoint:
-        print(f"  最佳验证 Loss: {checkpoint['best_val_loss']:.6f}")
+    if "best_val_mae" in checkpoint:
+        print(f"  最佳验证 MAE: {float(checkpoint['best_val_mae']):.6f}")
+    elif "best_val_loss" in checkpoint:
+        print(f"  最佳验证 Loss(legacy): {float(checkpoint['best_val_loss']):.6f}")
 
     train_losses = checkpoint.get("train_losses", [])
     print(f"  训练历史长度: {len(train_losses)} epochs")

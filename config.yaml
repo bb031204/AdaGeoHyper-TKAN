@@ -12,11 +12,11 @@ data:
   data_root: "D:/bishe/WYB"            # 数据根目录
   input_len: 12                         # 输入时间步长
   pred_len: 12                          # 预测时间步长
-  num_stations: 1100                    # null=使用全部站点(2048); 也可设为 512/1024
+  num_stations: 1024                    # null=使用全部站点(2048); 也可设为 512/1024
   sample_ratio: 1.0                     # 训练集样本采样比例 (0~1)
   val_sample_ratio: 1.0                 # 验证集样本采样比例
   test_sample_ratio: 1.0                # 测试集样本采样比例
-  include_context: true                # 是否启用 context 特征拼接到模型输入
+  include_context: false                # 是否启用 context 特征拼接到模型输入
   context_features:
     use_year: false                      # 年
     use_month: true                     # 月
@@ -29,30 +29,31 @@ data:
 
 # ---- 超图配置 ----
 hypergraph:
-  k_neighbors: 10                       # 候选邻域 K_max（方案3：动态裁剪在此基础上保留有效邻居）
+  k_neighbors: 5                       # 候选邻域 K_max（方案3：动态裁剪在此基础上保留有效邻居）
   lambda_geo: 1.0                       # 地理平面距离权重
   lambda_alt: 0.5                       # 海拔差权重
-  use_context_altitude: true            # position.pkl 无海拔时，是否用 context 第5通道作为海拔
   use_hypergraph_cache: true            # 是否使用超图缓存
   cache_dir: "cache"                    # 缓存目录
   summary_pool: "mean"                  # 状态摘要方式: mean / last / linear
   scorer_hidden_dim: 32                 # 打分网络隐藏维度
+  scorer_mode: "static"                 # 超图打分模式: dynamic(时序+地理) / static(仅地理静态打分)
+  use_state_summary_for_weights: false   # 兼容旧配置: true=dynamic, false=static（若未设置 scorer_mode 时生效）
   #
   dynamic_pruning:
-    enabled: true                       # 启用权重稀疏化动态裁剪超图
+    enabled: false                       # 启用权重稀疏化动态裁剪超图
     mode: "top_p"                      # top_p / threshold
-    top_p: 0.76                         # 累积权重阈值（top_p 模式）
+    top_p: 0.79                         # 累积权重阈值（top_p 模式）
     threshold: 0.05                     # 权重阈值（threshold 模式）
-    min_keep: 4                         # 每个站点至少保留邻居数（防断连）
+    min_keep: 5                         # 每个站点至少保留邻居数（防断连）
 
 # ---- 模型配置 ----
 model:
-  hidden_dim: 64                        # 空间模块隐藏维度
-  tkan_hidden_dim: 64                   # TKAN 隐藏维度
+  hidden_dim: 32                        # 空间模块隐藏维度
+  tkan_hidden_dim: 32                   # TKAN 隐藏维度
   tkan_layers: 2                        # TKAN 层数
   tkan_sub_kan_configs: [null, 3]       # TKAN 子KAN配置 (null=默认, int=spline_order)
   dropout: 0.1                          # Dropout 比例
-  fusion_dim: 64                        # 融合层维度
+  fusion_dim: 32                        # 融合层维度
   kan_grid_size: 5                      # KAN B-spline 网格大小
   kan_spline_order: 3                   # KAN B-spline 阶数
   hypergraph_layers: 2                  # 超图卷积层数
@@ -61,10 +62,10 @@ model:
 
 # ---- 训练配置 ----
 training:
-  batch_size: 16                        # 批大小
+  batch_size: 8                        # 批大小
   epochs: 120                            # 训练轮数
   #
-  learning_rate: 0.0035                  # 学习率
+  learning_rate: 0.0030                  # 学习率
   weight_decay: 0.0001                  # 权重衰减
   device: "cuda"                        # cuda / auto / cpu
   seed: 42                              # 随机种子
@@ -74,15 +75,16 @@ training:
   scheduler_step_size: 20               # StepLR 步长
   scheduler_gamma: 0.5                  # StepLR 衰减因子
   grad_clip: 1.0                        # 梯度裁剪阈值
-  loss_type: "huber"                    # 损失函数: mse / l1 / huber /mae？？
+  gradient_accumulation_steps: 2        # 梯度累计步数 (总batch=batch_size*steps)
+  loss_type: "l1"                    # 损失函数: mse / l1 / huber /mae？？
   huber_delta: 1.0                      # HuberLoss delta (仅 loss_type=huber 时生效)
   warmup_epochs: 0                      # 学习率 warmup 轮数 (0=不启用)
   use_amp: true                         # 是否启用 AMP 混合精度
-  use_compile: true                     # 是否启用 torch.compile 编译加速 (需 PyTorch 2.0+)
-  compile_warmup: true                  # 是否执行 compile 预热（前向+反向预编译）
-  compile_warmup_tail_shapes: true      # 是否预编译尾 batch 形状（避免 143/144 这类尾步等待）
+  use_compile: false                     # 是否启用 torch.compile 编译加速 (需 PyTorch 2.0+)
+  compile_warmup: false                   # 是否执行 compile 预热（前向+反向预编译）
+  compile_warmup_tail_shapes: false       # 是否预编译尾 batch 形状（避免 143/144 这类尾步等待）
   # A) 平台期自适应调参（避免长期平台）
-  adaptive_tuning_enabled: true         # 平台期自适应调参开关
+  adaptive_tuning_enabled: false         # 平台期自适应调参开关
   adaptive_tuning_patience: 5          # 连续多少轮无改善触发调参
   adaptive_tuning_loss_type: "l1"       # 触发后切换的损失函数
   adaptive_tuning_lr_drop: 0       # 触发后学习率下降幅度（下限见代码）
@@ -95,7 +97,7 @@ training:
   early_stop_min_delta: 0.0             # 认为“有改善”的最小变化量
 
   # C) 动态K贴底反馈（避免长期锁死在 min_keep）
-  dynamic_k_feedback_enabled: true      # 是否开启动态K贴底反馈
+  dynamic_k_feedback_enabled: false      # 是否开启动态K贴底反馈
   dynamic_k_floor_patience: 2           # 连续多少轮贴底后触发
   dynamic_k_floor_margin: 0.2           # 贴底判定阈值：k_mean <= min_keep + margin
   dynamic_k_top_p_step: 0.02            # 每次触发 top_p 上调步长
@@ -107,3 +109,15 @@ output:
   save_best_only: true                  # 是否只保存最佳模型
   resume_from_checkpoint: null          # 恢复训练checkpoint路径, null表示不恢复
   log_interval: 10                      # 每多少个 batch 打印一次日志
+
+# ------------- 激进调参配置 -------------
+aggressive_tuning:
+  # 数据预处理/特征处理（默认关闭，需实验时手动开启）
+  robust_preprocess:
+    enabled: false
+    lower_q: 0.001
+    upper_q: 0.999
+  # context 周期特征 sin/cos 编码
+  context_calendar_encoding: false
+  # 使用 context altitude 作为超图海拔（当 position.pkl 无海拔时才有意义）
+  use_context_altitude: true

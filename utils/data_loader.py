@@ -328,6 +328,7 @@ class WeatherDataset(Dataset):
         station_indices: Optional[np.ndarray] = None,
         include_context: bool = False,
         context_indices: Optional[List[int]] = None,
+        context_calendar_encoding: bool = True,
         element_settings: Optional[Dict] = None,
     ):
         super().__init__()
@@ -335,6 +336,7 @@ class WeatherDataset(Dataset):
         self.mode = mode
         self.include_context = include_context
         self.context_indices = context_indices or []
+        self.context_calendar_encoding = bool(context_calendar_encoding)
         self.element_settings = element_settings or {}
         self.weather_scaler = weather_scaler
         self.context_scaler = context_scaler
@@ -407,7 +409,8 @@ class WeatherDataset(Dataset):
                 )
 
             context_sel = context[..., self.context_indices]
-            context_sel = _preprocess_context_calendar(context_sel, self.context_indices)
+            if self.context_calendar_encoding:
+                context_sel = _preprocess_context_calendar(context_sel, self.context_indices)
             if self.context_scaler is not None:
                 context_sel = self.context_scaler.transform(context_sel)
 
@@ -517,6 +520,7 @@ def create_data_loaders(
     seed: int = 42,
     include_context: bool = False,
     context_features: Optional[Dict[str, bool]] = None,
+    context_calendar_encoding: bool = True,
     use_context_altitude: bool = True,
     element: Optional[str] = None,
     fixed_station_indices: Optional[np.ndarray] = None,
@@ -532,7 +536,7 @@ def create_data_loaders(
     element_settings = get_element_settings(element_name)
     rp_cfg = dict(robust_preprocess or {})
     if "enabled" not in rp_cfg:
-        rp_cfg["enabled"] = (element_name == "Temperature")
+        rp_cfg["enabled"] = False
     rp_cfg.setdefault("lower_q", 0.001)
     rp_cfg.setdefault("upper_q", 0.999)
 
@@ -599,7 +603,8 @@ def create_data_loaders(
 
         context_fit = trn_raw["context"][:, :, station_indices, :] if station_indices is not None else trn_raw["context"]
         context_sel_fit = context_fit[..., context_indices]
-        context_sel_fit = _preprocess_context_calendar(context_sel_fit, context_indices)
+        if context_calendar_encoding:
+            context_sel_fit = _preprocess_context_calendar(context_sel_fit, context_indices)
         selected_context_dim = context_sel_fit.shape[-1]
         if context_scaler is None:
             context_fit_2d = context_sel_fit.reshape(-1, selected_context_dim)
@@ -640,6 +645,7 @@ def create_data_loaders(
         station_indices=station_indices,
         include_context=include_context,
         context_indices=context_indices,
+        context_calendar_encoding=context_calendar_encoding,
         element_settings=element_settings,
     )
     val_set = WeatherDataset(
@@ -651,6 +657,7 @@ def create_data_loaders(
         station_indices=station_indices,
         include_context=include_context,
         context_indices=context_indices,
+        context_calendar_encoding=context_calendar_encoding,
         element_settings=element_settings,
     )
     test_set = WeatherDataset(
@@ -662,6 +669,7 @@ def create_data_loaders(
         station_indices=station_indices,
         include_context=include_context,
         context_indices=context_indices,
+        context_calendar_encoding=context_calendar_encoding,
         element_settings=element_settings,
     )
 
