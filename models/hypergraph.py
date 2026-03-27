@@ -269,6 +269,8 @@ class AdaptiveGeoHypergraph(nn.Module):
         pruning_threshold: float = 0.05,
         pruning_min_keep: int = 2,
         use_state_summary_for_weights: bool = True,
+        propagation_mode: str = "stable_local",
+        residual_alpha: float = 0.7,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -282,6 +284,8 @@ class AdaptiveGeoHypergraph(nn.Module):
         self.summary_pool = summary_pool
         self.num_layers = num_layers
         self.use_state_summary_for_weights = bool(use_state_summary_for_weights)
+        self.propagation_mode = str(propagation_mode).strip().lower()
+        self.residual_alpha = float(max(0.0, min(1.0, residual_alpha)))
 
         # ---- 动态稀疏化配置 (方案3) ----
         self.dynamic_pruning = dynamic_pruning
@@ -662,13 +666,11 @@ class AdaptiveGeoHypergraph(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        超图空间传播前向传播（标准 HGNN 风格）。
+        超图空间传播前向传播。
 
-        Args:
-            x: [B, T, N, F] 输入时空特征
-
-        Returns:
-            H_s: [B, T, N, D] 空间增强特征
+        propagation_mode:
+          - stable_local: 稳定版动态邻域聚合（推荐）
+          - current_hgnn: 兼容旧 HGNN 风格实现
         """
         assert self._graph_built, "请先调用 build_graph() 构建超图结构！"
 
@@ -680,57 +682,68 @@ class AdaptiveGeoHypergraph(nn.Module):
         # ---- 计算自适应权重 ----
         weights = self._compute_adaptive_weights(x)  # [B, N, K+1]
 
-        # ---- 标准 HGNN 传播 ----
-        # H 是固定超边-节点骨架（每个中心节点一条超边）
-        # 动态机制通过边内节点贡献权重 weights 融入
-        h = x.reshape(B * T, N, F_in)  # [B*T, N, F]
+        # 额外诊断：权重熵（越高越平均）
+        w_safe = weights.clamp_min(self.degree_clamp_min)
+        entropy = -(w_safe * w_safe.log()).sum(dim=-1).mean().item()
+        if self._last_pruning_stats is not None:
+            self._last_pruning_stats["weight_entropy"] = float(entropy)
+            self._last_pruning_stats["propagation_mode"] = self.propagation_mode
 
-        # 预计算平铺维度
-        nbr_idx_flat = nbr_idx.reshape(-1)  # [N*(K+1)]
-        w_bt = weights.unsqueeze(1).expand(-1, T, -1, -1).reshape(B * T, N, K_plus_1)  # [B*T, N, K+1]
+        # ---- 稳定版动态邻域聚合（默认） ----
+        if self.propagation_mode != "current_hgnn":
+            h = x.reshape(B * T, N, F_in)  # [B*T, N, F]
+            nbr_idx_flat = nbr_idx.reshape(-1)
+            w_bt = weights.unsqueeze(1).expand(-1, T, -1, -1).reshape(B * T, N, K_plus_1, 1)
 
-        # 预计算“节点属于哪些超边”的索引（基于 H_static）
-        # H_static: [N, E], N==E
-        h_static = self.H_static.to(device)  # [N, E]
-        node_edge_mask = (h_static > 0).to(w_bt.dtype)  # [N, E]
+            for layer_idx in range(self.num_layers):
+                prev_h = h
+                nbr_features = h[:, nbr_idx_flat, :].reshape(B * T, N, K_plus_1, -1)
+
+                # 中心节点保真：权重中 self-loop 已强制保留，额外做残差混合
+                aggregated = (nbr_features * w_bt).sum(dim=2)
+
+                out = self.conv_layers[layer_idx](aggregated)
+                out = self.layer_norms[layer_idx](out)
+                out = self.activation(out)
+                out = self.dropout_layer(out)
+
+                # 残差保护，防止信息破坏/过平滑
+                if prev_h.shape[-1] != out.shape[-1]:
+                    prev_h = self.conv_layers[layer_idx](prev_h)
+                h = self.residual_alpha * out + (1.0 - self.residual_alpha) * prev_h
+
+            return h.reshape(B, T, N, self.hidden_dim)
+
+        # ---- 兼容旧 HGNN 风格 ----
+        h = x.reshape(B * T, N, F_in)
+        nbr_idx_flat = nbr_idx.reshape(-1)
+        w_bt = weights.unsqueeze(1).expand(-1, T, -1, -1).reshape(B * T, N, K_plus_1)
+        h_static = self.H_static.to(device)
+        node_edge_mask = (h_static > 0).to(w_bt.dtype)
 
         for layer_idx in range(self.num_layers):
-            # 1) 节点度 D_v：节点参与所有超边的贡献总和（动态权重）
-            #    d_v[i] = sum_e H[i,e] * w_e(i)
-            #    这里用 node_edge_mask 统计成员关系，结合 w_bt 的节点贡献
-            #    将 w_bt 累加到节点所属的所有超边上
-            node_weight = w_bt.sum(dim=-1)  # [B*T, N]
-            d_v = (node_edge_mask * node_weight.unsqueeze(-1)).sum(dim=-1).clamp_min(self.degree_clamp_min)  # [B*T, N]
+            node_weight = w_bt.sum(dim=-1)
+            d_v = (node_edge_mask * node_weight.unsqueeze(-1)).sum(dim=-1).clamp_min(self.degree_clamp_min)
             d_v_inv_sqrt = d_v.pow(-0.5)
 
-            h_norm = h * d_v_inv_sqrt.unsqueeze(-1)  # [B*T, N, F]
-
-            # 2) 节点 -> 超边：H^T D_v^{-1/2} X
+            h_norm = h * d_v_inv_sqrt.unsqueeze(-1)
             nbr_features = h_norm[:, nbr_idx_flat, :].reshape(B * T, N, K_plus_1, -1)
-            edge_feat = (nbr_features * w_bt.unsqueeze(-1)).sum(dim=2)  # [B*T, E=N, F]
+            edge_feat = (nbr_features * w_bt.unsqueeze(-1)).sum(dim=2)
 
-            # 3) 超边度 D_e：每条超边内成员权重之和
-            d_e = w_bt.sum(dim=-1).clamp_min(self.degree_clamp_min)  # [B*T, E]
-            d_e_inv = d_e.pow(-1.0)
-            edge_feat = edge_feat * d_e_inv.unsqueeze(-1)
+            d_e = w_bt.sum(dim=-1).clamp_min(self.degree_clamp_min)
+            edge_feat = edge_feat * d_e.pow(-1.0).unsqueeze(-1)
 
-            # 4) 超边 -> 节点：按节点的“超边隶属关系”聚合
-            #    使用 H_static 反向聚合，而非仅依赖邻域索引近似
-            edge_feat_exp = edge_feat.unsqueeze(1).expand(-1, N, -1, -1)  # [B*T, N, E, F]
-            node_edge = node_edge_mask.unsqueeze(0)  # [1, N, E]
-            node_agg = (edge_feat_exp * node_edge.unsqueeze(-1)).sum(dim=2)  # [B*T, N, F]
-
-            # 5) 再次 D_v^{-1/2}
+            edge_feat_exp = edge_feat.unsqueeze(1).expand(-1, N, -1, -1)
+            node_agg = (edge_feat_exp * node_edge_mask.unsqueeze(0).unsqueeze(-1)).sum(dim=2)
             node_agg = node_agg * d_v_inv_sqrt.unsqueeze(-1)
 
-            # 6) 线性映射 + 归一化
-            h = self.conv_layers[layer_idx](node_agg)
-            h = self.layer_norms[layer_idx](h)
-            h = self.activation(h)
-            h = self.dropout_layer(h)
+            out = self.conv_layers[layer_idx](node_agg)
+            out = self.layer_norms[layer_idx](out)
+            out = self.activation(out)
+            out = self.dropout_layer(out)
+            h = out
 
-        H_s = h.reshape(B, T, N, self.hidden_dim)
-        return H_s
+        return h.reshape(B, T, N, self.hidden_dim)
 
     def extra_repr(self) -> str:
         return (

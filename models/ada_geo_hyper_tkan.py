@@ -97,6 +97,7 @@ class AdaGeoHyperTKAN(nn.Module):
         pred_head_hidden: int = 128,
         tkan_chunk_size: int = 0,
         use_gradient_checkpoint: bool = False,
+        spatial_mode: str = "stable_spatial",
     ):
         super().__init__()
 
@@ -108,6 +109,8 @@ class AdaGeoHyperTKAN(nn.Module):
         self.pred_len = pred_len
         self.tkan_chunk_size = tkan_chunk_size
         self.use_gradient_checkpoint = use_gradient_checkpoint
+        self.spatial_mode = str(spatial_mode).strip().lower()
+        self.pure_tkan_proj = nn.Linear(input_dim, hidden_dim)
 
         # 确保 fusion_dim 一致
         assert hidden_dim == tkan_hidden_dim, (
@@ -140,6 +143,8 @@ class AdaGeoHyperTKAN(nn.Module):
             pruning_threshold=pruning_threshold,
             pruning_min_keep=pruning_min_keep,
             use_state_summary_for_weights=use_state_summary_for_weights,
+            propagation_mode="stable_local" if self.spatial_mode == "stable_spatial" else "current_hgnn",
+            residual_alpha=0.7,
         )
 
         # ===============================
@@ -214,12 +219,15 @@ class AdaGeoHyperTKAN(nn.Module):
         """
         B, T, N, F_in = x.shape
 
-        # ---- 1. 空间模块 ----
-        # X → H_s: 通过超图卷积增强空间关系
-        if self.use_gradient_checkpoint and self.training:
-            H_s = grad_checkpoint(self.spatial_module, x, use_reentrant=False)
+        # ---- 1. 空间模块（可切换消融模式） ----
+        # pure_tkan: 跳过空间模块，直接把输入线性映射到 hidden 维度
+        if self.spatial_mode == "pure_tkan":
+            H_s = self.pure_tkan_proj(x)
         else:
-            H_s = self.spatial_module(x)
+            if self.use_gradient_checkpoint and self.training:
+                H_s = grad_checkpoint(self.spatial_module, x, use_reentrant=False)
+            else:
+                H_s = self.spatial_module(x)
         # H_s: [B, T, N, D]
 
         # ---- 2. TKAN 时间模块 ----

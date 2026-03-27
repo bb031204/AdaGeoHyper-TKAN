@@ -109,6 +109,8 @@ def load_best_model(
     else:
         use_state_summary_for_weights = bool(hyper_cfg.get("use_state_summary_for_weights", True))
 
+    spatial_mode = str(config.get("ablation", {}).get("spatial_mode", "stable_spatial")).strip().lower()
+
     model = AdaGeoHyperTKAN(
         input_dim=input_feature_dim,
         output_dim=target_dim,
@@ -138,6 +140,7 @@ def load_best_model(
         pred_head_hidden=model_cfg["hidden_dim"] * 2,
         tkan_chunk_size=model_cfg.get("tkan_chunk_size", 0),
         use_gradient_checkpoint=False,
+        spatial_mode=spatial_mode,
     ).to(device)
 
     cache_dir = os.path.join(project_root, config["hypergraph"]["cache_dir"])

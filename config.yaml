@@ -16,16 +16,16 @@ data:
   sample_ratio: 1.0                     # 训练集样本采样比例 (0~1)
   val_sample_ratio: 1.0                 # 验证集样本采样比例
   test_sample_ratio: 1.0                # 测试集样本采样比例
-  include_context: false                # 是否启用 context 特征拼接到模型输入
+  include_context: true                 # 是否启用 context 特征拼接到模型输入（温度任务建议开启）
   context_features:
     use_year: false                      # 年
     use_month: true                     # 月
     use_day: true                       # 日
-    use_time: true                     # 时间窗内索引
-    use_region: true                  # 陆地覆盖比例/陆海掩码类特征 (0~1)
-    use_altitude: true                 # 海拔
+    use_time: true                      # 时间窗内索引（温度任务建议开启）
+    use_region: true                    # 陆地覆盖比例/陆海掩码类特征 (0~1)
+    use_altitude: true                  # 海拔
     use_longitude: true                 # 经度
-    use_latitude: true                 # 纬度
+    use_latitude: true                  # 纬度
 
 # ---- 超图配置 ----
 hypergraph:
@@ -36,8 +36,8 @@ hypergraph:
   cache_dir: "cache"                    # 缓存目录
   summary_pool: "mean"                  # 状态摘要方式: mean / last / linear
   scorer_hidden_dim: 32                 # 打分网络隐藏维度
-  scorer_mode: "static"                 # 超图打分模式: dynamic(时序+地理) / static(仅地理静态打分)
-  use_state_summary_for_weights: false   # 兼容旧配置: true=dynamic, false=static（若未设置 scorer_mode 时生效）
+  scorer_mode: "dynamic"                # 超图打分模式: dynamic(地理+时序摘要) / static(仅地理静态打分)
+  use_state_summary_for_weights: true    # 兼容旧配置: true=dynamic, false=static（若未设置 scorer_mode 时生效）
   #
   dynamic_pruning:
     enabled: false                       # 启用权重稀疏化动态裁剪超图
@@ -48,12 +48,12 @@ hypergraph:
 
 # ---- 模型配置 ----
 model:
-  hidden_dim: 32                        # 空间模块隐藏维度
-  tkan_hidden_dim: 32                   # TKAN 隐藏维度
+  hidden_dim: 42                        # 空间模块隐藏维度
+  tkan_hidden_dim: 42                   # TKAN 隐藏维度
   tkan_layers: 2                        # TKAN 层数
   tkan_sub_kan_configs: [null, 3]       # TKAN 子KAN配置 (null=默认, int=spline_order)
   dropout: 0.1                          # Dropout 比例
-  fusion_dim: 32                        # 融合层维度
+  fusion_dim: 42                        # 融合层维度
   kan_grid_size: 5                      # KAN B-spline 网格大小
   kan_spline_order: 3                   # KAN B-spline 阶数
   hypergraph_layers: 2                  # 超图卷积层数
@@ -65,7 +65,7 @@ training:
   batch_size: 8                        # 批大小
   epochs: 120                            # 训练轮数
   #
-  learning_rate: 0.0030                  # 学习率
+  learning_rate: 0.0025                  # 学习率（温度任务更稳）
   weight_decay: 0.0001                  # 权重衰减
   device: "cuda"                        # cuda / auto / cpu
   seed: 42                              # 随机种子
@@ -76,13 +76,13 @@ training:
   scheduler_gamma: 0.5                  # StepLR 衰减因子
   grad_clip: 1.0                        # 梯度裁剪阈值
   gradient_accumulation_steps: 2        # 梯度累计步数 (总batch=batch_size*steps)
-  loss_type: "l1"                    # 损失函数: mse / l1 / huber /mae？？
+  loss_type: "huber"                   # 损失函数: mse / l1 / huber
   huber_delta: 1.0                      # HuberLoss delta (仅 loss_type=huber 时生效)
   warmup_epochs: 0                      # 学习率 warmup 轮数 (0=不启用)
   use_amp: true                         # 是否启用 AMP 混合精度
-  use_compile: false                     # 是否启用 torch.compile 编译加速 (需 PyTorch 2.0+)
-  compile_warmup: false                   # 是否执行 compile 预热（前向+反向预编译）
-  compile_warmup_tail_shapes: false       # 是否预编译尾 batch 形状（避免 143/144 这类尾步等待）
+  use_compile: false                    # 是否启用 torch.compile 编译加速 (当前结构默认关闭以提升稳定性)
+  compile_warmup: true                   # 是否执行 compile 预热（前向+反向预编译）
+  compile_warmup_tail_shapes: true       # 是否预编译尾 batch 形状（避免 143/144 这类尾步等待）
   # A) 平台期自适应调参（避免长期平台）
   adaptive_tuning_enabled: false         # 平台期自适应调参开关
   adaptive_tuning_patience: 5          # 连续多少轮无改善触发调参
@@ -102,6 +102,10 @@ training:
   dynamic_k_floor_margin: 0.2           # 贴底判定阈值：k_mean <= min_keep + margin
   dynamic_k_top_p_step: 0.02            # 每次触发 top_p 上调步长
   dynamic_k_top_p_max: 0.82             # top_p 上调上限
+
+# ---- 消融/对照配置 ----
+ablation:
+  spatial_mode: "stable_spatial"       # pure_tkan / stable_spatial / current_hgnn
 
 # ---- 输出配置 ----
 output:

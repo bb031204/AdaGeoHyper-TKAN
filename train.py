@@ -182,6 +182,8 @@ def build_model(config: dict, input_feature_dim: int, target_dim: int, position_
     else:
         use_state_summary_for_weights = bool(hyper_cfg.get("use_state_summary_for_weights", True))
 
+    spatial_mode = str(config.get("ablation", {}).get("spatial_mode", "stable_spatial")).strip().lower()
+
     model = AdaGeoHyperTKAN(
         input_dim=input_feature_dim,
         output_dim=target_dim,
@@ -211,6 +213,7 @@ def build_model(config: dict, input_feature_dim: int, target_dim: int, position_
         pred_head_hidden=model_cfg["hidden_dim"] * 2,
         tkan_chunk_size=model_cfg.get("tkan_chunk_size", 0),
         use_gradient_checkpoint=model_cfg.get("use_gradient_checkpoint", False),
+        spatial_mode=spatial_mode,
     )
 
     model = model.to(device)
@@ -384,6 +387,15 @@ def evaluate(
     all_trues = np.concatenate(all_trues, axis=0)
     metrics = compute_metrics(all_preds, all_trues, element_name=element_name)
     metrics["loss"] = avg_loss
+
+    per_step = compute_per_step_metrics(
+        all_preds,
+        all_trues,
+        num_steps=min(all_preds.shape[1], 12),
+        element_name=element_name,
+    )
+    metrics["per_step_MAE"] = per_step.get("MAE", [])
+    metrics["per_step_RMSE"] = per_step.get("RMSE", [])
 
     return metrics
 
@@ -586,6 +598,18 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
         f"要素: {element_name}, 生效k={config['hypergraph']['k_neighbors']}, "
         f"config_k={config_k_raw}, degree_clamp_min={config['hypergraph']['degree_clamp_min']}, "
         f"float32_norm={config['hypergraph']['float32_norm']}"
+    )
+
+    scorer_mode = str(config.get("hypergraph", {}).get("scorer_mode", "")).strip().lower() or "legacy"
+    spatial_mode = str(config.get("ablation", {}).get("spatial_mode", "stable_spatial")).strip().lower()
+    accum_steps = int(config["training"].get("gradient_accumulation_steps", 1))
+    accum_steps = max(1, accum_steps)
+    eff_batch = int(config["training"]["batch_size"]) * accum_steps
+    logger.info(
+        f"[运行模式] spatial_mode={spatial_mode}, scorer_mode={scorer_mode}, "
+        f"include_context={bool(config['data'].get('include_context', False))}, "
+        f"batch_size={config['training']['batch_size']}, accum_steps={accum_steps}, effective_batch={eff_batch}, "
+        f"use_amp={bool(config['training'].get('use_amp', False))}, use_compile={bool(config['training'].get('use_compile', True))}"
     )
     logger.info(f"输出目录: {output_dir}")
 
@@ -1306,6 +1330,17 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
             metric_lines.insert(4, f"          {C.DIM}│{C.RESET}  VecMAE: {C.WHITE}{val_metrics['VectorMAE']:.4f}{C.RESET}")
         if "VectorRMSE" in val_metrics:
             metric_lines.insert(5, f"          {C.DIM}│{C.RESET}  VecRMSE: {C.WHITE}{val_metrics['VectorRMSE']:.4f}{C.RESET}")
+        step_mae = val_metrics.get("per_step_MAE", [])
+        step_rmse = val_metrics.get("per_step_RMSE", [])
+        if step_mae and step_rmse:
+            metric_lines.append(
+                f"          {C.DIM}│{C.RESET}  StepMAE[t1/t6/t12]: "
+                f"{C.WHITE}{step_mae[0]:.3f}/{step_mae[min(5, len(step_mae)-1)]:.3f}/{step_mae[-1]:.3f}{C.RESET}"
+            )
+            metric_lines.append(
+                f"          {C.DIM}│{C.RESET}  StepRMSE[t1/t6/t12]: "
+                f"{C.WHITE}{step_rmse[0]:.3f}/{step_rmse[min(5, len(step_rmse)-1)]:.3f}/{step_rmse[-1]:.3f}{C.RESET}"
+            )
 
         raw_model = getattr(model, "_orig_mod", model)
         pruning_stats = raw_model.get_last_pruning_stats() if hasattr(raw_model, "get_last_pruning_stats") else None
