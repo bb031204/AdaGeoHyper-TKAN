@@ -125,14 +125,16 @@ class WeatherPreprocessor:
         normalize: bool = True,
         scaler_type: str = "standard",
         context_scaler_type: str = "standard",
-        preprocessor: Optional[WeatherPreprocessor] = None,
+        weather_scaler: Optional[object] = None,
+        context_scaler: Optional[object] = None,
         fitted: bool = False,
     ):
         self.kelvin_to_celsius = bool(kelvin_to_celsius)
         self.normalize = bool(normalize)
         self.scaler_type = str(scaler_type).strip().lower()
         self.context_scaler_type = str(context_scaler_type).strip().lower()
-        self.preprocessor = preprocessor
+        self.weather_scaler = weather_scaler
+        self.context_scaler = context_scaler
         self.fitted = bool(fitted)
 
     def fit(self, train_weather: np.ndarray, train_context: Optional[np.ndarray] = None):
@@ -432,8 +434,7 @@ class WeatherDataset(Dataset):
         self,
         data_dir: str,
         mode: str = "trn",
-        weather_scaler: Optional[object] = None,
-        context_scaler: Optional[object] = None,
+        preprocessor: Optional[WeatherPreprocessor] = None,
         sample_ratio: float = 1.0,
         num_stations: Optional[int] = None,
         station_indices: Optional[np.ndarray] = None,
@@ -449,8 +450,7 @@ class WeatherDataset(Dataset):
         self.context_indices = context_indices or []
         self.context_calendar_encoding = bool(context_calendar_encoding)
         self.element_settings = element_settings or {}
-        self.weather_scaler = weather_scaler
-        self.context_scaler = context_scaler
+        self.preprocessor = preprocessor
 
         pkl_path = os.path.join(data_dir, f"{mode}.pkl")
         logger.info(f"[Data] Loading {mode}: {pkl_path}")

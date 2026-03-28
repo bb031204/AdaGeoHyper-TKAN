@@ -397,6 +397,8 @@ def predict(output_dir: str, config_path: str = None):
     if use_amp:
         logger.info("[AMP] 混合精度推理已启用")
     logger.info("[预测] 开始测试集预测...")
+    if str(config.get("data", {}).get("dataset_name", "")).strip().lower() == "temperature":
+        logger.info("[预测] Temperature metrics/output are reported in Kelvin (K) after inverse_transform")
     predictions, ground_truth = predict_on_test(
         model, test_loader, device, weather_scaler, preprocessor, target_weather_dim, use_amp=use_amp
     )

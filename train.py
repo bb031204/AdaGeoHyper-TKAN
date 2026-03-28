@@ -1471,7 +1471,8 @@ def train(config_path: str = "config.yaml", resume_checkpoint: str = None,
     tqdm.write(f"\n  {C.GREEN}{'━' * W}{C.RESET}")
     tqdm.write(f"  {C.GREEN}{C.BOLD}{'TRAINING COMPLETE':^{W}}{C.RESET}")
     tqdm.write(f"  {C.GREEN}{'─' * W}{C.RESET}")
-    tqdm.write(f"    Best MAE: {C.GREEN}{C.BOLD}{best_val_mae:.6f}{C.RESET}"
+    unit_suffix = " K" if str(dataset_name).strip().lower() == "temperature" else ""
+    tqdm.write(f"    Best MAE: {C.GREEN}{C.BOLD}{best_val_mae:.6f}{unit_suffix}{C.RESET}"
                f"    Total Time: {C.CYAN}{total_time_str}{C.RESET}"
                f"    Epochs: {C.WHITE}{epoch}/{epochs}{C.RESET}")
     tqdm.write(f"  {C.GREEN}{'━' * W}{C.RESET}")
